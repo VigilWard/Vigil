@@ -6,6 +6,14 @@ on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "run = 正常执行；test = 只发一条测试消息到飞书"
+        type: choice
+        options:
+          - run
+          - test
+        default: run
 
 permissions:
   contents: read
@@ -39,4 +47,4 @@ jobs:
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
-        run: python watch.py
+        run: python watch.py ${{ inputs.mode || 'run' }}
