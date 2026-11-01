@@ -1,0 +1,119 @@
+name: Vigil
+
+on:
+  schedule:
+    # 每 10 分钟一轮。GitHub 的 cron 在整点/半点容易排队，实际可能延迟几分钟。
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run=正常跑一轮 / test=只发测试卡片 / reset=清空基线 / probe=探测翻译接口"
+        type: choice
+        options:
+          - run
+          - test
+          - reset
+          - probe
+        default: run
+
+# 需要往 state 分支写基线
+permissions:
+  contents: write
+
+# 同一时间只允许一轮在跑：两轮并发会互相覆盖 state，导致重复推送
+concurrency:
+  group: vigil-state
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+      FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+      FEISHU_WEBHOOKS: ${{ secrets.FEISHU_WEBHOOKS }}
+      # 设成 0 可以彻底关掉翻译（内容就不会发往 Google）
+      TRANSLATE: ${{ vars.TRANSLATE || '1' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 取回基线
+        id: fetch_state
+        if: inputs.mode != 'probe'
+        run: |
+          set -euo pipefail
+
+          # 必须把「分支不存在」和「拉取失败」分开：以前任何 fetch 失败都被当成
+          # "还没有 state 分支"，于是拿空基线跑一轮，再由回写步骤 force push 覆盖，
+          # 待送达队列就此永久丢失。
+          set +e
+          git ls-remote --exit-code --heads origin state >/dev/null 2>&1
+          code=$?
+          set -e
+
+          case "$code" in
+            0)
+              echo "state 分支存在，取回基线"
+              if ! git fetch --depth=1 origin state:refs/remotes/origin/state; then
+                echo "::error::state 分支存在但拉取失败；本轮中止，避免用空基线覆盖已有状态"
+                exit 1
+              fi
+              if git show refs/remotes/origin/state:state.json > state.json 2>/dev/null; then
+                echo "已取回基线（$(wc -c < state.json) 字节）"
+              else
+                rm -f state.json
+                echo "state 分支存在但没有 state.json，按全新基线处理"
+              fi
+              ;;
+            2)
+              echo "state 分支还不存在，这一轮会新建基线"
+              ;;
+            *)
+              echo "::error::无法访问远端仓库（git ls-remote 退出码 $code）；本轮中止"
+              exit 1
+              ;;
+          esac
+
+      - name: 运行
+        run: |
+          set -euo pipefail
+          case "${{ inputs.mode || 'run' }}" in
+            test)  python watch.py --test ;;
+            reset) python watch.py --reset ;;
+            probe) python tools/check_google.py ;;
+            *)     python watch.py ;;
+          esac
+
+      # 即使推送失败（退出码 1）也要把基线写回去，否则待送达队列会丢。
+      # 但「取回基线」失败时必须跳过：那一轮的 state 是空的，写回去等于清空线上状态。
+      - name: 回写基线
+        if: always() && inputs.mode != 'probe' && steps.fetch_state.outcome == 'success'
+        run: |
+          set -euo pipefail
+          if [ ! -f state.json ]; then
+            echo "没有 state.json，跳过"
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 避免 Windows 上的 autocrlf 影响 blob 哈希（本地手动跑时）
+          git config --local core.autocrlf false
+
+          new_blob=$(git hash-object -w state.json)
+          old_blob=$(git rev-parse -q --verify refs/remotes/origin/state:state.json || true)
+          if [ "$new_blob" = "$old_blob" ]; then
+            echo "基线未变化，跳过提交"
+            exit 0
+          fi
+
+          # 孤立提交：state 分支永远只有一个快照，不会随运行次数膨胀
+          tree=$(printf '100644 blob %s\tstate.json\n' "$new_blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "state: $(date -u +%Y-%m-%dT%H:%M:%SZ)")
+          git push --force origin "$commit:refs/heads/state"
+          echo "已更新 state 分支：$commit"
