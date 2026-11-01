@@ -1,0 +1,25 @@
+# 这里只放工具配置：项目本身零第三方依赖、也不需要打包，
+# 直接 `python watch.py` 就能跑。加 [project] 反而会让人以为要 pip install。
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RET"]
+ignore = [
+    "E501",   # 行长由 formatter 管，注释里偶尔会超
+    "SIM108", # 三元表达式不一定更好读
+    "RET504", # 先赋值再 return 有时是为了断点调试
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["vigil"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["vigil", "watch.py", "tools", "tests"]
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
