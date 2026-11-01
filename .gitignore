@@ -1,25 +1,6 @@
 __pycache__/
-*.py[cod]
-*.pyo
-
-# 静态检查的缓存（ruff / mypy 跑一次就会生成）
 .ruff_cache/
 .mypy_cache/
-
-# Actions 运行时生成，存在 state 分支里，不进主分支
 state.json
 state.json.tmp
-
-# 本地私有配置（含 token 的源写在 config.local.json 里）
 config.local.json
-
-.venv/
-venv/
-.DS_Store
-*.log
-
-# 样式预览是生成物，随时可以用 tools/preview_cards.py 重建
-preview/
-
-# 本地助手的工作记录，不属于项目内容
-.workbuddy-ai/
