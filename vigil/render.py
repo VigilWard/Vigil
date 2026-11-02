@@ -95,7 +95,7 @@ def shorten_bytes(text: str, budget: int) -> str:
     """按 UTF-8 字节截断，不会切出半个汉字。"""
     if budget <= 0:
         return ""
-    raw = text.encode("utf-8")
+    raw = text.encode("utf-8", "replace")
     if len(raw) <= budget:
         return text
     if budget <= 3:
@@ -239,8 +239,8 @@ def paginate(blocks: list[tuple[str, list[str]]], budget: int, max_pages: int):
                 if not text:
                     break
             sep = 1 if current else 0
-            room = budget - len(current.encode("utf-8")) - sep
-            if len(text.encode("utf-8")) <= room:
+            room = budget - len(current.encode("utf-8", "replace")) - sep
+            if len(text.encode("utf-8", "replace")) <= room:
                 current = f"{current}\n{text}" if current else text
                 keys.extend(block_keys)
                 break

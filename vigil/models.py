@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -209,6 +210,19 @@ class Item:
         self.summary_zh = sanitize_text(self.summary_zh)
         self.also = tuple(sanitize_text(name) for name in self.also)
         self.merged = tuple(sanitize_text(key) for key in self.merged)
+        # 直接构造的 Item 也做一次范围兜底，避免把非法值写进 state。
+        try:
+            self.published = int(self.published)
+        except (TypeError, ValueError):
+            self.published = 0
+        if self.severity not in (0, 1, 2, 3, 4):
+            self.severity = 0
+        try:
+            self.cvss = float(self.cvss)
+        except (TypeError, ValueError):
+            self.cvss = 0.0
+        if not math.isfinite(self.cvss) or not 0 <= self.cvss <= 10:
+            self.cvss = 0.0
 
     @property
     def key(self) -> str:
@@ -258,22 +272,35 @@ class Item:
         if not isinstance(data, dict):
             raise StateError("state 中的条目必须是对象")
         try:
+            published = int(data.get("published", 0) or 0)
+            severity = int(data.get("severity", 0) or 0)
+            cvss = float(data.get("cvss", 0) or 0)
+            raw_cves = data.get("cves", ())
+            raw_also = data.get("also", ())
+            if not isinstance(raw_cves, (list, tuple)):
+                raise ValueError("cves 必须是数组")
+            if not isinstance(raw_also, (list, tuple)):
+                raise ValueError("also 必须是数组")
+            if severity not in (0, 1, 2, 3, 4):
+                raise ValueError(f"severity 超出 0~4：{severity}")
+            if not math.isfinite(cvss) or not 0 <= cvss <= 10:
+                raise ValueError(f"cvss 超出 0~10：{cvss}")
             return cls(
                 source_key=str(data["source_key"]),
                 source_name=str(data["source_name"]),
                 uid=str(data["uid"]),
                 title=str(data["title"]),
                 link=str(data.get("link", "")),
-                published=int(data.get("published", 0) or 0),
+                published=published,
                 summary=str(data.get("summary", "")),
-                cves=tuple(str(x) for x in data.get("cves", ())),
+                cves=tuple(str(x) for x in raw_cves),
                 exploited=bool(data.get("exploited", False)),
                 ransomware=bool(data.get("ransomware", False)),
-                severity=int(data.get("severity", 0) or 0),
-                cvss=float(data.get("cvss", 0) or 0),
+                severity=severity,
+                cvss=cvss,
                 title_zh=str(data.get("title_zh", "")),
                 summary_zh=str(data.get("summary_zh", "")),
-                also=tuple(str(x) for x in data.get("also", ())),
+                also=tuple(str(x) for x in raw_also),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise StateError(f"state 中的条目字段无效：{exc}") from exc

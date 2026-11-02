@@ -210,7 +210,7 @@ def _alert_chunks(alerts: list[Alert], budget: int):
     size = 0
     for alert in alerts:
         text = alert.text
-        length = len(text.encode("utf-8"))
+        length = len(text.encode("utf-8", "replace"))
         separator = 1 if chunk else 0
         if chunk and size + separator + length > budget:
             yield chunk
@@ -220,7 +220,7 @@ def _alert_chunks(alerts: list[Alert], budget: int):
         if length > budget:
             # 正常不会走到这里（源名有长度上限），但保留兜底。
             text = shorten_bytes(text, budget)
-            length = len(text.encode("utf-8"))
+            length = len(text.encode("utf-8", "replace"))
             log("⚠ 单条状态告警超过纯文本预算，已截断")
         chunk.append((alert, text))
         size += separator + length
@@ -364,7 +364,7 @@ def cmd_dry_run(config: Config, state_path) -> int:
     pages = compose(config, items, now, failures=report.failures,
                     skipped=report.skipped, markup=False, budget=MAX_CARD_BODY_BYTES)
     for index, page in enumerate(pages, 1):
-        size = len(page.as_text().encode("utf-8"))
+        size = len(page.as_text().encode("utf-8", "replace"))
         log(f"--- 第 {index}/{len(pages)} 页，{size} 字节（终端里不显示颜色和加粗） ---")
         print(page.as_text())
     log(f"dry-run：{len(items)} 条，{len(pages)} 页。未发送、未改动基线。")

@@ -38,7 +38,7 @@ from vigil.models import (
     StateError,
 )
 from vigil.net import Response
-from vigil.parse import cvss_of, parse_json, parse_nginx, severity_of
+from vigil.parse import cvss_of, parse_json, parse_nginx, parse_rss, severity_of
 from vigil.render import compose, render_item, sanitize_link
 from vigil.state import STATE_VERSION, State, load_state
 from vigil.translate import Provider, Translator
@@ -186,6 +186,22 @@ class TestSurrogateSafety(unittest.TestCase):
         self.assertIn(b"bad", payload)
 
 
+class TestStateItemValidation(unittest.TestCase):
+    BASE = {"source_key": "s", "source_name": "源", "uid": "1", "title": "标题"}
+
+    def test_nan_cvss_is_rejected(self):
+        with self.assertRaises(StateError):
+            Item.from_dict({**self.BASE, "cvss": "nan"})
+
+    def test_out_of_range_severity_is_rejected(self):
+        with self.assertRaises(StateError):
+            Item.from_dict({**self.BASE, "severity": 99})
+
+    def test_cves_must_be_an_array(self):
+        with self.assertRaises(StateError):
+            Item.from_dict({**self.BASE, "cves": "CVE-2026-1111"})
+
+
 class TestConfigAndStateEncoding(unittest.TestCase):
     def _config(self, tmp: str) -> Path:
         path = Path(tmp) / "config.json"
@@ -220,11 +236,25 @@ class TestConfigAndStateEncoding(unittest.TestCase):
             with self.assertRaises(StateError):
                 load_state(path)
 
+    def test_save_over_non_utf8_state_does_not_crash(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_bytes(b'{"version": 2, "seen": {"\xd6": "x"}}')
+            self.assertTrue(State().save(path))
+            self.assertEqual(load_state(path).seen, {})
+
     def test_invalid_saved_at_is_a_state_error(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
             path.write_text(json.dumps({"version": STATE_VERSION, "saved_at": "x"}),
                             encoding="utf-8")
+            with self.assertRaises(StateError):
+                load_state(path)
+
+    def test_nan_in_state_is_a_state_error(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text('{"version": 2, "saved_at": NaN}', encoding="utf-8")
             with self.assertRaises(StateError):
                 load_state(path)
 
@@ -242,6 +272,16 @@ class TestConfigAndStateEncoding(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(watch.main(["--config", str(config),
                                              "--state", str(bad_state)]), 2)
+
+
+class TestConfigNormalization(unittest.TestCase):
+    def test_kind_whitespace_and_case_are_normalized(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"sources": [{
+                "name": "a", "url": "https://a.test", "kind": " RSS ",
+            }]}), encoding="utf-8")
+            self.assertEqual(load_config(path).sources[0].kind, "rss")
 
 
 class TestMatchWhitespace(unittest.TestCase):
@@ -279,6 +319,19 @@ class TestCvssBareScore(unittest.TestCase):
         self.assertEqual(cvss_of("CVSS 3.1"), 0.0)
         self.assertEqual(cvss_of("CVSS 4.0"), 0.0)
         self.assertEqual(cvss_of("CVSS 3"), 0.0)
+
+
+class TestAtomRel(unittest.TestCase):
+    def test_full_uri_alternate_rel_is_recognized(self):
+        payload = (
+            '<feed xmlns="http://www.w3.org/2005/Atom"><entry>'
+            "<title>x</title>"
+            '<link rel="http://www.iana.org/assignments/relation/alternate" '
+            'href="https://e.test/a"/>'
+            "<id>1</id></entry></feed>"
+        )
+        item = parse_rss(payload, Source("x", "https://a.test/1"))[0]
+        self.assertEqual(item.link, "https://e.test/a")
 
 
 class TestNginxTruncation(unittest.TestCase):

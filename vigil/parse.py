@@ -336,7 +336,7 @@ def _atom_link(node: ET.Element) -> str:
         href = (child.get("href") or "").strip()
         if not href:
             continue
-        rel = (child.get("rel") or "alternate").lower()
+        rel = (child.get("rel") or "alternate").lower().rsplit("/", 1)[-1]
         if rel == "alternate":
             return href
         if not fallback:

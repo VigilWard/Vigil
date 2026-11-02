@@ -32,6 +32,11 @@ from .models import (
 STATE_VERSION = 2
 
 
+def _reject_json_constant(value: str) -> None:
+    """拒绝 JSON 里的 NaN / Infinity，避免 int()/float 比较抛未捕获异常。"""
+    raise ValueError(f"不允许的 JSON 常量：{value}")
+
+
 @dataclass(slots=True)
 class SourceHealth:
     """单个源的健康状态。"""
@@ -301,7 +306,10 @@ class State:
         sources = raw.get("sources", {})
         if not isinstance(sources, dict):
             raise StateError("state.sources 必须是对象")
-        state.sources = {str(key): SourceHealth.from_dict(value) for key, value in sources.items()}
+        state.sources = {
+            sanitize_text(str(key)): SourceHealth.from_dict(value)
+            for key, value in sources.items()
+        }
 
         seen = raw.get("seen", {})
         if not isinstance(seen, dict) or not all(
@@ -354,8 +362,8 @@ class State:
         previous = None
         if path.exists():
             try:
-                previous = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                previous = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 previous = None
         if isinstance(previous, dict):
             previous.pop("saved_at", None)
@@ -389,7 +397,9 @@ def load_state(path: Path | str) -> State:
     except UnicodeDecodeError as exc:
         raise StateError(f"state.json 不是 UTF-8 编码：{exc}") from exc
     try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as exc:
+        # Python 的 json 默认接受 NaN/Infinity；它们会让 int()/float 比较
+        # 在后续校验里抛 ValueError，必须在解析入口就拒绝。
+        raw = json.loads(text, parse_constant=_reject_json_constant)
+    except ValueError as exc:
         raise StateError(f"state.json 不是合法 JSON（已停止，避免覆盖基线）：{exc}") from exc
     return State.from_dict(raw)

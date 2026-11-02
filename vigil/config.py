@@ -159,11 +159,14 @@ def load_config(path: Path | str) -> Config:
             raise ConfigError(f"{where}的 name 与前面的源重复：{name}（消息里会分不清）")
         names.add(name)
 
-        url = sanitize_text(expand_env(raw_url.strip()))
+        url = sanitize_text(expand_env(raw_url.strip())).strip()
         _check_url(url, where)
 
         kind = entry.get("kind", "rss")
-        if not isinstance(kind, str) or kind not in PARSERS:
+        if not isinstance(kind, str):
+            raise ConfigError(f"{where}的 kind 必须是字符串")
+        kind = sanitize_text(kind).strip().lower()
+        if kind not in PARSERS:
             raise ConfigError(f"{where}的 kind 必须是 {sorted(PARSERS)}")
 
         match = entry.get("match", "")
