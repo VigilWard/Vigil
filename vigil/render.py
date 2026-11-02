@@ -93,19 +93,29 @@ def shorten_bytes(text: str, budget: int) -> str:
     return raw[: budget - 3].decode("utf-8", "ignore") + "…"
 
 
+def _inline(text: str) -> str:
+    """把字段压成单行。
+
+    解析层的 clean() 已经做过这件事，但 state 里的条目可能被手工改过。
+    一个换行就能把「【标题原文】」后面的内容挤到下一行，让整张卡片错位，
+    所以渲染前再兜一次。
+    """
+    return " ".join((text or "").split())
+
+
 def render_item(item: Item, *, markup: bool = True) -> str:
     """一条漏洞渲染成字段化的多行文本。字段没有值就整行省略，不留空壳。
 
     标题和摘要都拆成「翻译 / 原文」两行：有译文时两行都给（译文在上、原文在下），
     没译文时只给原文那一行。标签必须和内容对得上——不能把英文挂在「翻译」下面。
     """
-    title = item.title
+    title = _inline(item.title)
     if item.cves:
         stripped = CVE_TITLE_PREFIX.sub("", title).strip()
         if stripped:
             title = stripped
 
-    title_zh = item.title_zh.strip()
+    title_zh = _inline(item.title_zh)
     if title_zh and item.cves:
         stripped = CVE_TITLE_PREFIX.sub("", title_zh).strip()
         if stripped:
@@ -140,11 +150,12 @@ def render_item(item: Item, *, markup: bool = True) -> str:
             value = f"<font color='red'>{value}</font>"
         lines.append("【标记】" + value)
 
-    summary_zh = item.summary_zh.strip()
-    if summary_zh and summary_zh != item.summary:
+    summary_zh = _inline(item.summary_zh)
+    summary = _inline(item.summary)
+    if summary_zh and summary_zh != summary:
         lines.append("【摘要翻译】" + (escape_md(summary_zh) if markup else summary_zh))
-    if item.summary:
-        lines.append("【摘要原文】" + (escape_md(item.summary) if markup else item.summary))
+    if summary:
+        lines.append("【摘要原文】" + (escape_md(summary) if markup else summary))
 
     if item.link:
         # 链接也来自外部源：不处理的话，一个带 <font> / ** 的 URL 就能往卡片里注入样式。

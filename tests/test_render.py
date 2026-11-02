@@ -103,6 +103,16 @@ class TestRenderItem(unittest.TestCase):
         item.title_zh = "CVE-2026-1111: 中文标题"
         self.assertIn("【标题翻译】中文标题", render_item(item, markup=False))
 
+    def test_multiline_input_is_collapsed(self):
+        """state 里的条目被手工改过时，换行不能把卡片排版挤歪。
+
+        真实数据经 clean() 处理过不会有换行，但渲染层再兜一次，代价几乎为零。
+        """
+        item = make_item(1, title="第一行\n第二行", summary="摘要一\n摘要二")
+        lines = render_item(item, markup=False).splitlines()
+        self.assertEqual(lines[0], "【标题原文】第一行 第二行")
+        self.assertEqual(lines[1], "【摘要原文】摘要一 摘要二")
+
     def test_identical_translation_is_not_repeated(self):
         """译文和原文一样（中文源）时只留一行，别出现两行一模一样的内容。"""
         item = make_item(1, title="Same title")
