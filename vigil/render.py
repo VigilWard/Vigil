@@ -16,6 +16,8 @@ from .models import (
     MAX_ITEMS,
     MAX_LINK_CHARS,
     MAX_PAGES,
+    MAX_SUMMARY_CHARS,
+    MAX_TITLE_CHARS,
     Config,
     Failure,
     Item,
@@ -74,11 +76,19 @@ def escape_md(text: str) -> str:
 # 刻意**不**转义 _ & ( ) # + $ !：它们在 URL 里合法且极常见
 # （security_advisories、?a=1&b=2），换成实体虽然显示一致，却会让链接没法点。
 _LINK_JUNK = re.compile(r"[<>\"'`|*~\[\]]")
+# 链接里如果出现 &#60; / &#42; 这类 HTML 实体，飞书 lark_md 会把它解码成
+# < / *，等于绕过了上面的字面剔除。只清掉"能还原成 markdown 控制符"的实体，
+# 保留 &amp; 和普通查询参数里的 &，避免把合法 URL 改坏。
+_HTML_ENTITY = re.compile(
+    r"&#(?:x[0-9a-f]+|\d+);"
+    r"|&(?:lt|gt|sim|ast|lowbar|lbrack|rbrack|num|plus|grave|dollar|excl|bsol);",
+    re.I,
+)
 
 
 def sanitize_link(link: str) -> str:
     """把外部来源的链接压成"不可能构造标记"的形式。"""
-    return _LINK_JUNK.sub("", link)
+    return _HTML_ENTITY.sub("", _LINK_JUNK.sub("", link))
 
 
 def shorten_bytes(text: str, budget: int) -> str:
@@ -109,13 +119,13 @@ def render_item(item: Item, *, markup: bool = True) -> str:
     标题和摘要都拆成「翻译 / 原文」两行：有译文时两行都给（译文在上、原文在下），
     没译文时只给原文那一行。标签必须和内容对得上——不能把英文挂在「翻译」下面。
     """
-    title = _inline(item.title)
+    title = shorten(_inline(item.title), MAX_TITLE_CHARS)
     if item.cves:
         stripped = CVE_TITLE_PREFIX.sub("", title).strip()
         if stripped:
             title = stripped
 
-    title_zh = _inline(item.title_zh)
+    title_zh = shorten(_inline(item.title_zh), MAX_TITLE_CHARS)
     if title_zh and item.cves:
         stripped = CVE_TITLE_PREFIX.sub("", title_zh).strip()
         if stripped:
@@ -125,7 +135,8 @@ def render_item(item: Item, *, markup: bool = True) -> str:
 
     lines = []
     if item.cves:
-        lines.append("【编号】" + "、".join(item.cves))
+        cve_text = "、".join(item.cves)
+        lines.append("【编号】" + (escape_md(cve_text) if markup else cve_text))
 
     # 加粗只给"主行"：有译文时是译文，没译文时是原文
     if translated_title:
@@ -150,8 +161,8 @@ def render_item(item: Item, *, markup: bool = True) -> str:
             value = f"<font color='red'>{value}</font>"
         lines.append("【标记】" + value)
 
-    summary_zh = _inline(item.summary_zh)
-    summary = _inline(item.summary)
+    summary_zh = shorten(_inline(item.summary_zh), MAX_SUMMARY_CHARS)
+    summary = shorten(_inline(item.summary), MAX_SUMMARY_CHARS)
     if summary_zh and summary_zh != summary:
         lines.append("【摘要翻译】" + (escape_md(summary_zh) if markup else summary_zh))
     if summary:
@@ -295,16 +306,33 @@ def compose(
         blocks.append((f"⚠ 本轮未检查：{name}\n", []))
 
     for label, groups in build_sections(config, items):
-        blocks.append((f"【{label}】", []))
+        section = f"【{label}】"
+        first_group = True
         for name, values, hidden in groups:
             # 源名来自配置，和条目一样要转义，否则名字里的 * 会把整行吃掉
             shown_name = escape_md(name) if markup else name
-            blocks.append((f"{shown_name}（{len(values) + hidden}条）", []))
-            for item in values:
-                # 条目自带结尾空行：块与块之间自然隔开，源标题紧跟第一个条目
-                blocks.append((render_item(item, markup=markup) + "\n", [item.key, *item.merged]))
+            header = f"{shown_name}（{len(values) + hidden}条）"
+            if first_group:
+                # 分组标题、源标题和第一条绑成一个块：分页时不会出现
+                # "上一页只剩标题、条目全在下一页"的孤儿标题。
+                header = f"{section}\n{header}"
+                first_group = False
+            if values:
+                first = values[0]
+                blocks.append((
+                    header + "\n" + render_item(first, markup=markup) + "\n",
+                    [first.key, *first.merged],
+                ))
+                for item in values[1:]:
+                    # 条目自带结尾空行：块与块之间自然隔开，源标题紧跟第一个条目
+                    blocks.append((render_item(item, markup=markup) + "\n",
+                                   [item.key, *item.merged]))
+            else:
+                blocks.append((header, []))
             if hidden > 0:
                 blocks.append((f"…另有{hidden}条未列出，将顺延到后续轮次\n", []))
+        if first_group:
+            blocks.append((section, []))
 
     title = f"Vigil · {datetime.fromtimestamp(now, CST):%m-%d %H:%M}"
     exploited = sum(1 for item in items if item.exploited)

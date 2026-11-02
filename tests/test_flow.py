@@ -49,6 +49,7 @@ class FlowCase(unittest.TestCase):
             mock.patch.dict(os.environ, {
                 "FEISHU_WEBHOOK": self.webhook,
                 "FEISHU_WEBHOOKS": "",
+                "FEISHU_ALLOW_ANY_HOST": "1",
                 "TRANSLATE": "0",
             }),
         ]

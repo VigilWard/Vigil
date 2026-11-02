@@ -33,21 +33,23 @@ jobs:
       FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
       FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
       FEISHU_WEBHOOKS: ${{ secrets.FEISHU_WEBHOOKS }}
+      # 仅在用自建代理转发飞书 webhook 时需要设成 1；正常直连不要开。
+      FEISHU_ALLOW_ANY_HOST: ${{ vars.FEISHU_ALLOW_ANY_HOST || '' }}
       # 设成 0 可以彻底关掉翻译（内容就不会发往第三方）
       TRANSLATE: ${{ vars.TRANSLATE || '1' }}
-      # 百度通用翻译（可选）：配了就会排在第一位，比免费源稳、中文质量更好。
+      # 百度通用翻译（可选）：配了会排在 Google 之后、MyMemory 之前，比免费源稳。
       # 放在 Secrets 里，不要写进任何会提交的文件。
       BAIDU_APPID: ${{ secrets.BAIDU_APPID }}
       BAIDU_KEY: ${{ secrets.BAIDU_KEY }}
       # 给 MyMemory 的 de 参数：匿名配额 5 千字符/天 → 带邮箱 5 万字符/天。
-      # 想换邮箱就加一个仓库变量 TRANSLATE_EMAIL，会覆盖这里的默认值。
-      TRANSLATE_EMAIL: ${{ vars.TRANSLATE_EMAIL || 'vigilis@163.com' }}
+      # 默认留空，避免把模板作者的邮箱带给所有 fork；需要时配仓库变量。
+      TRANSLATE_EMAIL: ${{ vars.TRANSLATE_EMAIL || '' }}
       # 可选：换 Google 的镜像或代理时用
       TRANSLATE_ENDPOINT: ${{ vars.TRANSLATE_ENDPOINT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
@@ -72,7 +74,21 @@ jobs:
                 echo "::error::state 分支存在但拉取失败；本轮中止，避免用空基线覆盖已有状态"
                 exit 1
               fi
-              if git show refs/remotes/origin/state:state.json > state.json 2>/dev/null; then
+              # 用 ls-tree 判断路径是否存在：git cat-file -e 对"路径不存在"
+              # 和"引用损坏"都返回 128，分不开；ls-tree 对缺失路径返回 0 + 空输出。
+              set +e
+              state_entries=$(git ls-tree -r --name-only refs/remotes/origin/state -- state.json 2>/dev/null)
+              state_code=$?
+              set -e
+              if [ "$state_code" -ne 0 ]; then
+                echo "::error::读取 state 分支失败（git ls-tree 退出码 $state_code）；本轮中止"
+                exit 1
+              fi
+              if [ -n "$state_entries" ]; then
+                if ! git show refs/remotes/origin/state:state.json > state.json; then
+                  echo "::error::state 分支存在 state.json 但读取失败；本轮中止，避免覆盖已有状态"
+                  exit 1
+                fi
                 echo "已取回基线（$(wc -c < state.json) 字节）"
               else
                 rm -f state.json

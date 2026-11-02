@@ -66,6 +66,9 @@ MAX_TITLE_CHARS = 240
 MAX_SUMMARY_CHARS = 300
 MAX_LINK_CHARS = 600
 MAX_UID_CHARS = 512
+# 源名会进卡片分组标题、状态告警和 state；限制长度，避免一个超长名字
+# 把告警正文撑爆（_send_alerts 按 18KB 分块，但单条告警仍应保持短小）。
+MAX_NAME_CHARS = 80
 # 单个源的原始文本上限，超过就截断。摘要最终只展示 300 字，没必要为
 # 几十万字的 HTML 做十几次正则替换——那是白烧 CPU，也是拒绝服务的入口。
 MAX_CLEAN_CHARS = 20000
@@ -114,6 +117,21 @@ class NotModified(VigilError):
     """服务端返回 304。"""
 
 
+def sanitize_text(value: str) -> str:
+    """清掉无法编码成 UTF-8 的孤立代理项（lone surrogate）。
+
+    JSON 的 ``\\ud800`` 这类转义是合法 JSON，``json.loads`` 会原样产出
+    一个孤立代理项；它会让 ``str.encode("utf-8")`` 抛 UnicodeEncodeError，
+    进而打挂指纹计算、state 写入和飞书请求体编码。这里统一替换成 ``?``，
+    保证进入 Item / Source / state 的文本一定可编码。
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    if not value:
+        return value
+    return value.encode("utf-8", "replace").decode("utf-8")
+
+
 @dataclass(slots=True)
 class Source:
     """一个配置里的数据源。
@@ -130,6 +148,19 @@ class Source:
     exploited: bool = False
     headers: dict[str, str] = field(default_factory=dict)
     mapping: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # 配置和 state 都可能被手工编辑；所有进入身份的文本先保证可编码。
+        self.name = sanitize_text(self.name)
+        self.url = sanitize_text(self.url)
+        self.kind = sanitize_text(self.kind)
+        self.match = sanitize_text(self.match)
+        self.headers = {
+            sanitize_text(key): sanitize_text(value) for key, value in self.headers.items()
+        }
+        self.mapping = {
+            sanitize_text(key): sanitize_text(value) for key, value in self.mapping.items()
+        }
 
     @property
     def key(self) -> str:
@@ -163,6 +194,21 @@ class Item:
     # 只在内存里用（merge() 产出 → compose() 消费），刻意不写进 state：
     # 每次 merge 都会重算，持久化只会让 state 变大且引入过期 key。
     merged: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # 这是最后一道防线：无论 Item 来自解析器、state 还是测试，
+        # 都不允许把孤立代理项带进指纹、JSON 或飞书请求体。
+        self.source_key = sanitize_text(self.source_key)
+        self.source_name = sanitize_text(self.source_name)
+        self.uid = sanitize_text(self.uid)
+        self.title = sanitize_text(self.title)
+        self.link = sanitize_text(self.link)
+        self.summary = sanitize_text(self.summary)
+        self.cves = tuple(sanitize_text(cve) for cve in self.cves)
+        self.title_zh = sanitize_text(self.title_zh)
+        self.summary_zh = sanitize_text(self.summary_zh)
+        self.also = tuple(sanitize_text(name) for name in self.also)
+        self.merged = tuple(sanitize_text(key) for key in self.merged)
 
     @property
     def key(self) -> str:
@@ -245,6 +291,11 @@ class PushTarget:
     webhook: str
     secret: str = ""
 
+    def __post_init__(self) -> None:
+        # Secret 从 JSON 对象里读出来时经常带尾随换行；签名必须用干净的值。
+        self.webhook = sanitize_text(self.webhook).strip()
+        self.secret = sanitize_text(self.secret).strip()
+
     @property
     def tid(self) -> str:
         return hashlib.sha256(self.webhook.encode("utf-8")).hexdigest()[:12]
@@ -276,7 +327,9 @@ def log(*args: object) -> None:
 
 
 def dump_json(data: object, *, indent: int | None = None) -> str:
-    return json.dumps(data, ensure_ascii=False, indent=indent, sort_keys=True)
+    text = json.dumps(data, ensure_ascii=False, indent=indent, sort_keys=True)
+    # 兜底：即使有漏网的孤立代理项，也不能让 state 写入在 encode 时崩掉。
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def shorten(text: str, limit: int) -> str:

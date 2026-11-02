@@ -11,7 +11,7 @@
     render.py     消息渲染与字节分页
     feishu.py     飞书签名、卡片封装与推送
     collect.py    抓取编排与跨源合并
-    translate.py  标题/摘要英译中（Google 免费接口，可选）
+    translate.py  标题/摘要英译中（Google / 百度 / MyMemory 自动降级，可选）
     app.py        命令行与一轮运行的编排
 
 用法：`python watch.py [--dry-run|--test|--reset]`，或直接 `from vigil.app import main`。

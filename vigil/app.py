@@ -46,6 +46,14 @@ class Alert:
     targets: set[str] = field(default_factory=set)
 
 
+FEISHU_HOST_SUFFIXES = (".feishu.cn", ".larksuite.com")
+
+
+def _is_feishu_host(host: str) -> bool:
+    host = host.lower().rstrip(".")
+    return host in ("feishu.cn", "larksuite.com") or host.endswith(FEISHU_HOST_SUFFIXES)
+
+
 def load_targets() -> list[PushTarget]:
     """读取推送目标。
 
@@ -55,6 +63,9 @@ def load_targets() -> list[PushTarget]:
     shared_secret = os.environ.get("FEISHU_SECRET", "").strip()
     raw = os.environ.get("FEISHU_WEBHOOKS", "").strip()
     single = os.environ.get("FEISHU_WEBHOOK", "").strip()
+    allow_any_host = os.environ.get("FEISHU_ALLOW_ANY_HOST", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
     entries: list = []
 
     if raw:
@@ -91,6 +102,7 @@ def load_targets() -> list[PushTarget]:
             if not isinstance(webhook, str) or not isinstance(secret, str):
                 raise ConfigError("FEISHU_WEBHOOKS 的 webhook/secret 必须是字符串")
             webhook = webhook.strip()
+            secret = secret.strip()
             if not webhook:
                 # 写了对象却没给地址，多半是复制漏了，不该静默跳过
                 raise ConfigError("FEISHU_WEBHOOKS 里有对象缺少 webhook")
@@ -103,6 +115,11 @@ def load_targets() -> list[PushTarget]:
             raise ConfigError(f"飞书 webhook 地址无法解析：{exc}") from exc
         if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
             raise ConfigError("飞书 webhook 必须是不含用户信息的完整 HTTPS 地址")
+        if not allow_any_host and not _is_feishu_host(parts.hostname):
+            raise ConfigError(
+                "飞书 webhook 必须使用 feishu.cn / larksuite.com 域名；"
+                "如果确实走代理，请设置 FEISHU_ALLOW_ANY_HOST=1"
+            )
         target = PushTarget(webhook, secret)
         if target.tid not in seen:
             targets.append(target)
@@ -187,27 +204,52 @@ def apply_alerts(state: State, alerts: list[Alert], delivered: dict[str, set[str
             health.alert_at = now
 
 
+def _alert_chunks(alerts: list[Alert], budget: int):
+    """按字节预算切分告警，保证每条告警都能完整进入某个 chunk。"""
+    chunk: list[tuple[Alert, str]] = []
+    size = 0
+    for alert in alerts:
+        text = alert.text
+        length = len(text.encode("utf-8"))
+        separator = 1 if chunk else 0
+        if chunk and size + separator + length > budget:
+            yield chunk
+            chunk = []
+            size = 0
+            separator = 0
+        if length > budget:
+            # 正常不会走到这里（源名有长度上限），但保留兜底。
+            text = shorten_bytes(text, budget)
+            length = len(text.encode("utf-8"))
+            log("⚠ 单条状态告警超过纯文本预算，已截断")
+        chunk.append((alert, text))
+        size += separator + length
+    if chunk:
+        yield chunk
+
+
 def _send_alerts(
     targets: list[PushTarget],
     alerts: list[Alert],
     deadline: float,
 ) -> tuple[bool, dict[str, set[str]]]:
-    """按目标拆开发送。返回 (是否全部成功, {源 key: 已收到的目标集合})。"""
+    """按目标、按预算分块发送。返回 (是否全部成功, {源 key: 已收到的目标集合})。"""
     delivered: dict[str, set[str]] = {}
     ok = True
     for target in targets:
         mine = [alert for alert in alerts if target.tid in alert.targets]
         if not mine:
             continue
-        text = shorten_bytes("\n".join(alert.text for alert in mine), MAX_TEXT_BYTES)
-        try:
-            send(text, target, deadline=deadline)
-        except PushError as exc:
-            log(f"⚠ 状态告警发送到 {target.tid} 失败：{exc}")
-            ok = False
-            continue
-        for alert in mine:
-            delivered.setdefault(alert.key, set()).add(target.tid)
+        for chunk in _alert_chunks(mine, MAX_TEXT_BYTES):
+            text = "\n".join(part for _, part in chunk)
+            try:
+                send(text, target, deadline=deadline)
+            except PushError as exc:
+                log(f"⚠ 状态告警发送到 {target.tid} 失败：{exc}")
+                ok = False
+                break
+            for alert, _ in chunk:
+                delivered.setdefault(alert.key, set()).add(target.tid)
     return ok, delivered
 
 
@@ -397,6 +439,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             return cmd_dry_run(config, args.state)
         return cmd_run(config, load_state(args.state), args.state)
-    except (VigilError, OSError) as exc:
+    except (VigilError, OSError, UnicodeError) as exc:
         log(f"错误：{exc}")
         return 2

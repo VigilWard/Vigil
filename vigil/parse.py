@@ -23,6 +23,7 @@ from .models import (
     ParseError,
     Source,
     log,
+    sanitize_text,
     shorten,
 )
 
@@ -68,7 +69,11 @@ def clean(value: str | None) -> str:
     入口先截断：摘要最终只留 300 字，为几十万字的正文跑十几次正则纯属浪费，
     而且给了恶意 feed 一个把 runner 拖死的入口。
     """
-    text = (value or "")[:MAX_CLEAN_CHARS]
+    raw = value or ""
+    if not isinstance(raw, str):
+        raw = str(raw)
+    # 先截断再 sanitize，避免对几十万字的正文做一次全量 encode。
+    text = sanitize_text(raw[:MAX_CLEAN_CHARS])
     text = html.unescape(text)
     text = text.translate(_ZERO_WIDTH)
     # 先统一换行符：邮件列表类源大量用 CRLF，行尾的 \r 会让 ^...$ 类的规则匹配不上
@@ -172,9 +177,13 @@ _SEVERITY_LABEL = re.compile(
 )
 _SCORE_LABEL = re.compile(r"(?:base\s+)?score\s*[:：=]?\s*(\d{1,2}(?:\.\d)?)", re.I)
 _CVSS_VALUE = re.compile(r"cvss[^\d]{0,12}v?\d(?:\.\d)?\s*[:：]\s*(\d{1,2}(?:\.\d)?)", re.I)
-_CVSS_VERSION = re.compile(r"cvss\s*v?\d(?:\.\d)?", re.I)
+_CVSS_VERSION = re.compile(r"cvss\s*v?(\d(?:\.\d)?)", re.I)
 _CVSS_VECTOR = re.compile(r"CVSS:\d\.\d/[A-Z:/]+", re.I)
 _CVSS_CONTEXT = re.compile(r"cvss|score|severity|评分|风险", re.I)
+# CVSS 版本号只有这几个；"CVSS 9.8" 里的 9.8 是分数，不能当版本剥掉。
+_CVSS_KNOWN_VERSIONS = frozenset({"2.0", "3.0", "3.1", "4.0"})
+# 没有小数点的分数（CVSS 10 / CVSS 9）；要求前面是 cvss 且后面不是数字或点。
+_CVSS_INT = re.compile(r"cvss\s*[:：=]?\s*(\d{1,2})(?![\d.])", re.I)
 _DECIMAL = re.compile(r"(?<![\d.])(\d{1,2}\.\d)(?![.\d])")
 
 
@@ -186,6 +195,15 @@ def _level_of(score: float) -> int:
     if score >= 4:
         return 2
     return 1 if score > 0 else 0
+
+
+def _strip_cvss_versions(text: str) -> str:
+    """只剥掉真正的版本号，保留 "CVSS 9.8" 这类裸分数。"""
+
+    def replace(match: re.Match[str]) -> str:
+        return " " if match.group(1) in _CVSS_KNOWN_VERSIONS else match.group(0)
+
+    return _CVSS_VERSION.sub(replace, text)
 
 
 def cvss_of(text: str) -> float:
@@ -203,7 +221,15 @@ def cvss_of(text: str) -> float:
                 return value
     if not _CVSS_CONTEXT.search(text):
         return 0.0
-    stripped = _CVSS_VERSION.sub(" ", _CVSS_VECTOR.sub(" ", text))
+    # "CVSS 10" / "CVSS 9" 这类整数分数；放在版本剥离之前，
+    # 避免 _CVSS_INT 把 "CVSS 3.1" 里的 3 误认成整数分数。
+    integer = _CVSS_INT.search(text)
+    if integer:
+        value = float(integer.group(1))
+        # 2/3/4 更可能是 "CVSS 3" 这种版本写法，不当成整数分数。
+        if value not in {2.0, 3.0, 4.0} and 0 <= value <= 10:
+            return value
+    stripped = _strip_cvss_versions(_CVSS_VECTOR.sub(" ", text))
     match = _DECIMAL.search(stripped)
     if match:
         value = float(match.group(1))
@@ -508,9 +534,15 @@ def _list_items(text: str):
             continue
         open_end = text.find(">", after)
         if open_end < 0:
+            tail = text[start:]
+            if "<p" in tail.lower() or CVE_PATTERN.search(tail):
+                raise ParseError("NGINX 页面结构不完整（<li> 标签被截断），可能响应被截断")
             return
         close = text.find("</li>", open_end)
         if close < 0:
+            tail = text[open_end + 1:]
+            if "<p" in tail.lower() or CVE_PATTERN.search(tail):
+                raise ParseError("NGINX 页面结构不完整（<li> 未闭合），可能响应被截断")
             return
         yield text[open_end + 1:close]
         pos = close + len("</li>")

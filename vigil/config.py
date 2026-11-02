@@ -14,10 +14,12 @@ from urllib.parse import urlsplit
 from .models import (
     MAX_ITEMS,
     MAX_ITEMS_CAP,
+    MAX_NAME_CHARS,
     MAX_WINDOW_HOURS,
     Config,
     ConfigError,
     Source,
+    sanitize_text,
 )
 from .parse import PARSERS
 
@@ -93,8 +95,8 @@ def _check_headers(headers: dict[str, str], where: str) -> dict[str, str]:
     """
     cleaned: dict[str, str] = {}
     for name, value in headers.items():
-        name = name.strip()
-        value = expand_env(value).strip()
+        name = sanitize_text(name).strip()
+        value = sanitize_text(expand_env(value)).strip()
         if not HEADER_NAME_RE.match(name):
             raise ConfigError(f"{where}的 headers 字段名不合法：{name!r}")
         if "\r" in value or "\n" in value:
@@ -106,9 +108,13 @@ def _check_headers(headers: dict[str, str], where: str) -> dict[str, str]:
 def load_config(path: Path | str) -> Config:
     path = Path(path)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         raise ConfigError(f"无法读取配置 {path}：{exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"配置文件不是 UTF-8 编码：{exc}") from exc
+    try:
+        raw = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ConfigError(f"配置 JSON 无效：{exc}") from exc
 
@@ -146,12 +152,14 @@ def load_config(path: Path | str) -> Config:
         if not isinstance(raw_url, str) or not raw_url.strip():
             raise ConfigError(f"{where}缺少有效 url")
 
-        name = " ".join(raw_name.split())
+        name = sanitize_text(" ".join(raw_name.split()))
+        if len(name) > MAX_NAME_CHARS:
+            raise ConfigError(f"{where}的 name 过长（最多 {MAX_NAME_CHARS} 个字符）")
         if name in names:
             raise ConfigError(f"{where}的 name 与前面的源重复：{name}（消息里会分不清）")
         names.add(name)
 
-        url = expand_env(raw_url.strip())
+        url = sanitize_text(expand_env(raw_url.strip()))
         _check_url(url, where)
 
         kind = entry.get("kind", "rss")
@@ -161,6 +169,7 @@ def load_config(path: Path | str) -> Config:
         match = entry.get("match", "")
         if not isinstance(match, str):
             raise ConfigError(f"{where}的 match 必须是字符串")
+        match = sanitize_text(match).strip()
         if match:
             try:
                 re.compile(match)

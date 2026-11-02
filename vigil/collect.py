@@ -5,6 +5,7 @@ import re
 import time
 
 from .models import (
+    EMPTY_ALERT,
     BudgetExceeded,
     Config,
     Failure,
@@ -69,6 +70,11 @@ def collect(
             if not preview:
                 health.fail = 0
                 health.last_ok = _coarse(health.last_ok, now)
+                # 304 表示"内容和上一轮一样"。如果上一轮就是空内容，
+                # 这一轮仍然是空内容，必须继续累计，否则支持 ETag 的源
+                # 永远到不了 EMPTY_ALERT 阈值。
+                if health.had_items and 0 < health.empty < EMPTY_ALERT:
+                    health.empty += 1
             log(f"→ {source.name}（304 未变化）")
             continue
         except BudgetExceeded as exc:
@@ -111,14 +117,16 @@ def collect(
                 health.had_items = True
                 health.empty = 0
             elif health.had_items:
-                # 以前有内容，现在合法但为空：可能是页面结构变了
-                health.empty += 1
+                # 以前有内容，现在合法但为空：可能是页面结构变了。
+                # 到阈值就停，避免 304 每轮把计数推到无穷大、每轮都改 state。
+                health.empty = min(health.empty + 1, EMPTY_ALERT)
         if not parsed:
             log(f"→ {source.name}（合法但没有任何条目）")
 
         matched = parsed
-        if source.match:
-            matcher = re.compile(source.match, re.I)
+        pattern = source.match.strip()
+        if pattern:
+            matcher = re.compile(pattern, re.I)
             matched = [item for item in parsed if matcher.search(item.title)]
             log(f"   按 match 保留 {len(matched)}/{len(parsed)} 条")
 
@@ -182,6 +190,11 @@ def merge(items: list[Item], config: Config) -> list[Item]:
 
     只合并"来自不同源"的条目：同一个源里两条独立公告即使提到同一个 CVE
     也必须各自保留，否则会静默丢消息。
+
+    每个源先选一条代表参与跨源合并，其余同源条目原样保留；这样既能去重，
+    又不会把"同一源的两条独立公告"吞掉。代表按
+    (在野利用, 严重度, CVSS, 发布时间, 配置顺序) 选，避免配置里靠前的
+    低危源覆盖后面源的高危信息。
     """
     order = {source.key: index for index, source in enumerate(config.sources)}
     by_cve: dict[str, list[Item]] = {}
@@ -193,17 +206,48 @@ def merge(items: list[Item], config: Config) -> list[Item]:
         else:
             merged.append(item)
 
+    def rank(item: Item) -> tuple:
+        return (
+            not item.exploited,
+            -item.severity,
+            -item.cvss,
+            -item.published,
+            order.get(item.source_key, 999),
+            item.key,
+        )
+
     for group in by_cve.values():
-        if len({item.source_key for item in group}) < 2:
+        by_source: dict[str, list[Item]] = {}
+        for item in group:
+            by_source.setdefault(item.source_key, []).append(item)
+        if len(by_source) < 2:
             merged.extend(group)
             continue
-        winner = min(
-            group,
-            key=lambda item: (not item.exploited, order.get(item.source_key, 999), -item.published),
-        )
-        winner.also = tuple(sorted({item.source_name for item in group if item is not winner}))
-        # 只记直接对手的 key：被吸收的条目本身不可能带 merged（它从未写进 state）
-        winner.merged = tuple(sorted({item.key for item in group if item is not winner}))
+
+        # 每个源只拿一条代表去跨源合并；同源其余条目继续单独发。
+        representatives = {
+            source_key: min(source_items, key=rank)
+            for source_key, source_items in by_source.items()
+        }
+        winner = min(representatives.values(), key=rank)
+        others = [
+            item for source_key, item in representatives.items()
+            if source_key != winner.source_key
+        ]
+        winner.also = tuple(sorted({item.source_name for item in others}))
+        winner.merged = tuple(sorted({item.key for item in others}))
+        # 合并后的条目应该反映整组最严重的信号，而不是 winner 自己那一行。
+        winner.severity = max(item.severity for item in group)
+        winner.cvss = max(item.cvss for item in group)
+        winner.exploited = any(item.exploited for item in group)
+        winner.ransomware = any(item.ransomware for item in group)
         merged.append(winner)
+
+        # 非代表条目全部保留，避免"同源多条独立公告"被静默吞掉。
+        for source_key, source_items in by_source.items():
+            representative = representatives[source_key]
+            for item in source_items:
+                if item is not winner and item is not representative:
+                    merged.append(item)
 
     return merged

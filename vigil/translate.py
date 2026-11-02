@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 
 from . import net
-from .models import MAX_RESPONSE, Item, log
+from .models import MAX_RESPONSE, BudgetExceeded, Item, log
 
 DEFAULT_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
 MYMEMORY_ENDPOINT = "https://api.mymemory.translated.net/get"
@@ -245,10 +245,15 @@ class Translator:
         for provider in self.providers:
             if self._strikes.get(provider.name, 0) >= PROVIDER_STRIKES:
                 continue
+            if self.deadline is not None and time.monotonic() >= self.deadline:
+                raise BudgetExceeded("翻译时间预算已耗尽")
             self._throttle(provider)
             self.requests += 1
             try:
                 result = provider.translate(text, self.deadline)
+            except BudgetExceeded:
+                # 时间预算耗尽不是翻译源故障，不能算 strike，也不能换源重试。
+                raise
             except Exception as exc:  # noqa: BLE001 - 换下一个源，不让单点故障中断
                 strikes = self._strikes.get(provider.name, 0) + 1
                 self._strikes[provider.name] = strikes
@@ -288,6 +293,9 @@ class Translator:
                     item.title_zh = self.translate_text(item.title)
                 if item.summary and not item.summary_zh:
                     item.summary_zh = self.translate_text(item.summary)
+            except BudgetExceeded:
+                log("⚠ 翻译超出本轮时间预算，停止翻译（条目会用原文发出）")
+                break
             except Exception as exc:  # noqa: BLE001 - 所有源都挂了，退化成原文
                 self.failures += 1
                 log(f"⚠ 翻译失败：{exc}")

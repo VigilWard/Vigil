@@ -53,7 +53,9 @@ def _payload(body: dict, target: PushTarget) -> bytes:
     payload = {"timestamp": timestamp, **body}
     if target.secret:
         payload["sign"] = sign(target.secret, timestamp)
-    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    # errors="replace" 兜底：正常情况下 Item 层已经清掉孤立代理项；
+    # 即使漏网，也不能让整轮在 encode 时 traceback。
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8", "replace")
 
 
 def card_of(page: Page, template: str) -> dict:

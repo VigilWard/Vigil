@@ -1,6 +1,9 @@
 """针对已知缺陷的回归测试。
 
 每个用例对应一条曾经真实踩到的坑，注释里写清楚"为什么"，避免以后被改回去。
+本文件按缺陷归档，允许与模块级测试存在重叠：重叠用例通常覆盖不同的边界
+（例如带 deadline / 不带 deadline、正常响应 / 截断响应），不要因为"看起来
+重复"就删除，否则会丢掉对应的回归保护。
 """
 import gzip
 import io
@@ -187,7 +190,6 @@ class TestDecompression(unittest.TestCase):
         self.assertEqual(net._decompress(raw, "deflate", None).decode("utf-8"), "中文内容")
 
     def test_gzip_roundtrip(self):
-        import gzip
         raw = gzip.compress("中文内容".encode())
         self.assertEqual(net._decompress(raw, "gzip", None).decode("utf-8"), "中文内容")
 

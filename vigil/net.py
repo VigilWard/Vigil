@@ -4,7 +4,9 @@ from __future__ import annotations
 import gzip
 import http.client
 import io
+import ipaddress
 import re
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -54,6 +56,33 @@ def _origin(url: str) -> tuple[str, str, int]:
     return scheme, (parts.hostname or "").lower(), port or (443 if scheme == "https" else 80)
 
 
+def _blocked_host(host: str) -> bool:
+    """拒绝重定向到本机/私网/链路本地地址，降低 SSRF 风险。
+
+    只做字面 IP 和常见本地域名判断；不做 DNS 解析，避免在重定向处理器里
+    引入不可控的阻塞。真正的 DNS rebinding 仍需网络层 egress 策略兜底。
+    """
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        return True
+    if host in {"localhost", "localhost.localdomain", "metadata.google.internal", "metadata.goog"}:
+        return True
+    if host.endswith((".localhost", ".local", ".internal")):
+        return True
+    if "%" in host:  # IPv6 zone id，常见于链路本地地址
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # urllib 最终会走 getaddrinfo，而 inet_aton 接受 127.1、2130706433、
+        # 0x7f000001 这类 IPv4 简写；不补这一步，SSRF 防护会被简写绕过。
+        try:
+            address = ipaddress.ip_address(socket.inet_aton(host))
+        except (OSError, UnicodeError):
+            return False
+    return not address.is_global
+
+
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     """阻止 HTTPS 降级；跨源跳转时丢掉自定义请求头（可能含 token）。
 
@@ -68,6 +97,10 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         except FetchError as exc:
             raise urllib.error.HTTPError(newurl, code, str(exc), headers, fp) from exc
 
+        if new_origin[0] not in ("http", "https") or _blocked_host(new_origin[1]):
+            raise urllib.error.HTTPError(
+                newurl, code, "拒绝重定向到非 HTTP(S) 或非公网地址", headers, fp
+            )
         if old_origin[0] == "https" and new_origin[0] != "https":
             raise urllib.error.HTTPError(newurl, code, "拒绝 HTTPS 降级重定向", headers, fp)
         if old_origin != new_origin and req.get_method().upper() != "GET":
@@ -128,14 +161,16 @@ def decode_bytes(raw: bytes, declared: str | None = None) -> str:
     if charset:
         candidates.append(charset)
 
-    candidates.extend(["utf-8", "gb18030", "big5", "shift_jis", "latin-1"])
+    candidates.extend(["utf-8", "gb18030", "big5", "shift_jis"])
 
     for encoding in dict.fromkeys(candidates):
         try:
             return raw.decode(encoding)
         except (UnicodeDecodeError, LookupError):
             continue
-    raise FetchError("响应字符集无法识别")
+    # latin-1 能解码任意字节，是最后的兜底；放在循环外，避免"永远成功"
+    # 让循环里的失败分支看起来像死代码。
+    return raw.decode("latin-1")
 
 
 def read_limited(stream, limit: int, deadline: float | None) -> bytes:
@@ -241,8 +276,6 @@ def fetch(
                 # 非法 URL / 非法头，重试没有意义
                 raise FetchError(f"请求无法构造：{exc}") from exc
             with open_url(request, timeout=slot) as response:
-                if getattr(response, "status", 200) == 304:
-                    raise NotModified()
                 raw = read_limited(response, MAX_DOWNLOAD, deadline)
                 raw = _decompress(raw, response.headers.get("Content-Encoding", ""), deadline)
                 try:

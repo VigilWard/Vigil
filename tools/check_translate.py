@@ -62,8 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("text", nargs="*", help="要翻译的英文；省略则用内置样例")
     args = parser.parse_args(argv)
 
-    samples = [" ".join(args.text)] if args.text else [SAMPLE]
-    text = samples[0]
+    text = " ".join(args.text) if args.text else SAMPLE
 
     translator = build_translator()
     if translator is None:

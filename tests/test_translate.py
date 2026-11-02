@@ -192,10 +192,6 @@ class TestBuild(unittest.TestCase):
         self.assertEqual(google.endpoint, "https://mirror.test/translate_a/single")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def mymemory_body(translated: str, status=200, detail="") -> str:
     return json.dumps({
         "responseData": {"translatedText": translated, "match": 0.85},
@@ -397,3 +393,7 @@ class TestBaiduInChain(unittest.TestCase):
             translator = build_translator()
         assert translator is not None
         self.assertNotIn("baidu", [p.name for p in translator.providers])
+
+
+if __name__ == "__main__":
+    unittest.main()

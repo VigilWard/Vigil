@@ -24,6 +24,7 @@ from .models import (
     StateError,
     dump_json,
     log,
+    sanitize_text,
 )
 
 # v2：内容指纹的输入变了（摘要不再计入、NGINX 条目改用原始公告链接）。
@@ -66,7 +67,7 @@ class SourceHealth:
             value = data.get(field_name, "")
             if not isinstance(value, str):
                 raise StateError(f"state.sources.{field_name} 必须是字符串")
-            setattr(health, field_name, value)
+            setattr(health, field_name, sanitize_text(value))
         for field_name in ("fail", "skipped", "empty", "last_ok", "alert_at"):
             value = data.get(field_name, 0)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -77,7 +78,9 @@ class SourceHealth:
             isinstance(key, str) and isinstance(value, str) for key, value in sent.items()
         ):
             raise StateError("state.sources.alert_sent 必须是「目标 ID → 告警类型」的字符串对象")
-        health.alert_sent = dict(sent)
+        health.alert_sent = {
+            sanitize_text(key): sanitize_text(value) for key, value in sent.items()
+        }
         return health
 
 
@@ -108,9 +111,9 @@ class Pending:
             raise StateError(f"state.pending.{key}.since 必须是数字")
         return cls(
             item=data["item"],
-            fingerprint=str(data.get("fingerprint") or item.fingerprint),
+            fingerprint=sanitize_text(str(data.get("fingerprint") or item.fingerprint)),
             since=int(since),
-            sent=list(dict.fromkeys(sent)),
+            sent=list(dict.fromkeys(sanitize_text(value) for value in sent)),
         )
 
 
@@ -224,12 +227,18 @@ class State:
         for key, record in list(self.pending.items()):
             if now - record.since > PENDING_TTL:
                 self.pending.pop(key, None)
+                # 记成已处理，避免无日期的源（NGINX）下一轮又把同一条重新入队，
+                # 让 TTL 变成"每 7 天循环一次"而不是真正的丢弃。
+                self.seen[key] = record.fingerprint
+                self.seen_at[key] = now
                 dropped_pending += 1
 
         if len(self.pending) > MAX_PENDING:
             ordered = sorted(self.pending.items(), key=lambda pair: pair[1].since)
-            for key, _ in ordered[: len(self.pending) - MAX_PENDING]:
+            for key, record in ordered[: len(self.pending) - MAX_PENDING]:
                 self.pending.pop(key, None)
+                self.seen[key] = record.fingerprint
+                self.seen_at[key] = now
                 dropped_pending += 1
 
         cutoff = now - SEEN_RETENTION
@@ -281,7 +290,10 @@ class State:
             )
 
         state = cls()
-        state.saved_at = int(raw.get("saved_at", 0) or 0)
+        saved_at = raw.get("saved_at", 0)
+        if isinstance(saved_at, bool) or not isinstance(saved_at, (int, float)):
+            raise StateError("state.saved_at 必须是数字")
+        state.saved_at = int(saved_at)
         heartbeat = raw.get("heartbeat", 0)
         if isinstance(heartbeat, bool) or not isinstance(heartbeat, (int, float)):
             raise StateError("state.heartbeat 必须是数字")
@@ -296,7 +308,9 @@ class State:
             isinstance(key, str) and isinstance(value, str) for key, value in seen.items()
         ):
             raise StateError("state.seen 必须是字符串对象")
-        state.seen = dict(seen)
+        state.seen = {
+            sanitize_text(key): sanitize_text(value) for key, value in seen.items()
+        }
 
         seen_at = raw.get("seen_at", {})
         if not isinstance(seen_at, dict):
@@ -305,13 +319,14 @@ class State:
         for key, value in seen_at.items():
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise StateError(f"state.seen_at.{key} 必须是数字")
-            state.seen_at[str(key)] = int(value)
+            state.seen_at[sanitize_text(str(key))] = int(value)
 
         pending = raw.get("pending", {})
         if not isinstance(pending, dict):
             raise StateError("state.pending 必须是对象")
         state.pending = {
-            str(key): Pending.from_dict(str(key), value) for key, value in pending.items()
+            sanitize_text(str(key)): Pending.from_dict(sanitize_text(str(key)), value)
+            for key, value in pending.items()
         }
         return state
 
@@ -368,9 +383,13 @@ def load_state(path: Path | str) -> State:
     if not path.exists():
         return State()
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         raise StateError(f"state.json 读取失败：{exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise StateError(f"state.json 不是 UTF-8 编码：{exc}") from exc
+    try:
+        raw = json.loads(text)
     except json.JSONDecodeError as exc:
         raise StateError(f"state.json 不是合法 JSON（已停止，避免覆盖基线）：{exc}") from exc
     return State.from_dict(raw)
