@@ -306,6 +306,38 @@ class TestCompose(unittest.TestCase):
         self.assertTrue(text.startswith("Vigil · "))
         self.assertIn("\n【新披露】", text)
 
+    def test_merged_keys_do_not_inflate_overflow(self):
+        """被合并的 key 跟着上页用于确认，但不能算进"另有 N 条"。"""
+        config = Config(sources=[Source("A", "https://a.test/1"),
+                                 Source("B", "https://b.test/2")], max_items=50)
+        source_a, source_b = config.sources
+
+        def pair(number):
+            return [
+                Item(source_key=source_a.key, source_name="A", uid=f"a{number}",
+                     title=f"公告 {number} " + "标题" * 20,
+                     link=f"https://e.test/{number}", published=100 - number,
+                     summary="描述" * 60, cves=(f"CVE-2026-{number}",)),
+                Item(source_key=source_b.key, source_name="B", uid=f"b{number}",
+                     title=f"公告 {number} " + "标题" * 20,
+                     link=f"https://e.test/b{number}", published=100 - number,
+                     summary="描述" * 60, cves=(f"CVE-2026-{number}",)),
+            ]
+
+        raw = [item for number in range(1, 11) for item in pair(number)]
+        items = merge(raw, config)
+        self.assertEqual(len(items), 10)
+        visible = {item.key for item in items}
+        for budget in range(300, 3000, 50):
+            pages = compose(config, items, 1793000000, budget=budget)
+            subtitle = pages[-1].subtitle
+            overflow = int(subtitle.split("另有 ")[1].split(" 条")[0]) if "另有 " in subtitle else 0
+            if overflow:
+                acked = {key for page in pages for key in page.keys if key in visible}
+                self.assertEqual(overflow, len(items) - len(acked))
+                return
+        self.fail("没有找到能触发溢出的预算")
+
 
 class TestCardTemplate(unittest.TestCase):
     def test_exploited_is_red(self):

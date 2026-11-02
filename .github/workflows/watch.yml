@@ -35,6 +35,8 @@ jobs:
       FEISHU_WEBHOOKS: ${{ secrets.FEISHU_WEBHOOKS }}
       # 仅在用自建代理转发飞书 webhook 时需要设成 1；正常直连不要开。
       FEISHU_ALLOW_ANY_HOST: ${{ vars.FEISHU_ALLOW_ANY_HOST || '' }}
+      # 默认拒绝本机/私网源；确实要抓内网源时把仓库变量设成 1
+      VIGIL_ALLOW_PRIVATE_HOSTS: ${{ vars.VIGIL_ALLOW_PRIVATE_HOSTS || '' }}
       # 设成 0 可以彻底关掉翻译（内容就不会发往第三方）
       TRANSLATE: ${{ vars.TRANSLATE || '1' }}
       # 百度通用翻译（可选）：配了会排在 Google 之后、MyMemory 之前，比免费源稳。

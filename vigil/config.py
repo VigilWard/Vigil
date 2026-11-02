@@ -21,9 +21,13 @@ from .models import (
     Source,
     sanitize_text,
 )
+from .net import allow_private_hosts, is_blocked_host
 from .parse import PARSERS
 
 ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+# 只允许引用这个前缀的环境变量。config.json 是公开提交的，如果允许 ${FEISHU_SECRET}
+# 这类写法，一个"新增数据源"的 PR 就能把机器人密钥带进 URL/请求头发到外部。
+ENV_PREFIX = "VIGIL_"
 # HTTP 头字段名只允许 token 字符（RFC 7230）
 HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
@@ -35,10 +39,19 @@ DEFAULT_WINDOW_HOURS = 48
 
 
 def expand_env(value: str) -> str:
-    """把 ${VAR} 替换成环境变量；缺失时直接报错，避免把字面量发到线上。"""
+    """把 ${VIGIL_*} 替换成环境变量；缺失时直接报错，避免把字面量发到线上。
+
+    只允许 `VIGIL_` 前缀：配置文件是公开提交的，如果任意变量都能引用，
+    一个恶意 PR 就能用 `${FEISHU_SECRET}` 把机器人密钥拼进 URL 或请求头。
+    """
 
     def replace(match: re.Match[str]) -> str:
         name = match.group(1)
+        if not name.startswith(ENV_PREFIX):
+            raise ConfigError(
+                f"环境变量 {name} 不允许在配置里引用：只允许 {ENV_PREFIX}* 前缀，"
+                "避免配置读取飞书/百度等工具自身的密钥"
+            )
         if name not in os.environ:
             raise ConfigError(f"环境变量 {name} 未设置")
         return os.environ[name]
@@ -82,8 +95,18 @@ def _check_url(url: str, where: str) -> None:
         raise ConfigError(f"{where}的 url 无法解析：{exc}") from exc
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ConfigError(f"{where}的 url 必须是完整的 http/https 地址")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in url):
+        # 换行/控制字符会让 http.client 在发请求时才抛 ValueError，
+        # 也会把日志和卡片排版弄乱；在配置阶段就拒绝。
+        raise ConfigError(f"{where}的 url 不能包含换行或控制字符")
     if parts.username is not None or parts.password is not None:
         raise ConfigError(f"{where}的 url 不应包含用户名或密码，请改用 Secrets 和请求头")
+    # 启动时就拦住本机/私网地址，而不是等到抓取时才失败（否则每轮都会记一次源失败）。
+    if not allow_private_hosts() and is_blocked_host(parts.hostname):
+        raise ConfigError(
+            f"{where}的 url 指向本机或私网地址，已拒绝；"
+            "如果确实要抓内网源，请设置 VIGIL_ALLOW_PRIVATE_HOSTS=1"
+        )
 
 
 def _check_headers(headers: dict[str, str], where: str) -> dict[str, str]:
@@ -155,6 +178,8 @@ def load_config(path: Path | str) -> Config:
         name = sanitize_text(" ".join(raw_name.split()))
         if len(name) > MAX_NAME_CHARS:
             raise ConfigError(f"{where}的 name 过长（最多 {MAX_NAME_CHARS} 个字符）")
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
+            raise ConfigError(f"{where}的 name 不能包含控制字符")
         if name in names:
             raise ConfigError(f"{where}的 name 与前面的源重复：{name}（消息里会分不清）")
         names.add(name)
@@ -194,6 +219,13 @@ def load_config(path: Path | str) -> Config:
         if kind == "json" and "json" not in entry:
             raise ConfigError(f"{where}使用 kind=json 时必须提供 json 映射")
         mapping = _str_map(entry.get("json", {}), f"{where}的 json", MAPPING_KEYS)
+        for key, value in mapping.items():
+            # path 可以为空（表示根节点就是数组）；其它字段留空会让 dig(row, "")
+            # 返回整行对象，最后把一整段 JSON dump 当成标题推出去。
+            if key != "path" and not value.strip():
+                raise ConfigError(
+                    f"{where}的 json.{key} 不能为空；不写这个键就会使用默认字段名"
+                )
 
         source = Source(name, url, kind, match, limit, exploited, headers, mapping)
         if source.key in keys:

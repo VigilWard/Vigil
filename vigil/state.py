@@ -8,6 +8,7 @@ state.json 是整个工具唯一的"记忆"，因此这里的设计目标是：
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import asdict, dataclass, field
@@ -35,6 +36,29 @@ STATE_VERSION = 2
 def _reject_json_constant(value: str) -> None:
     """拒绝 JSON 里的 NaN / Infinity，避免 int()/float 比较抛未捕获异常。"""
     raise ValueError(f"不允许的 JSON 常量：{value}")
+
+
+def _reject_json_float(value: str) -> float:
+    """拒绝溢出成 inf 的浮点字面量（例如 1e400）。
+
+    `json.loads` 只在遇到 `NaN` / `Infinity` 时调用 parse_constant；
+    `1e400` 是合法 JSON 数字，但 `float()` 会得到 inf，随后 `int(inf)`
+    抛的 OverflowError 会绕过所有"state 不合法"的处理。必须在入口拦住。
+    """
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"不允许的非有限数字：{value}")
+    return number
+
+
+def _as_int(value, name: str) -> int:
+    """把 state 里的数字字段转成 int，越界时给出可读的 StateError。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise StateError(f"{name} 必须是数字")
+    try:
+        return int(value)
+    except (OverflowError, ValueError) as exc:
+        raise StateError(f"{name} 超出可表示范围：{value!r}") from exc
 
 
 @dataclass(slots=True)
@@ -74,10 +98,8 @@ class SourceHealth:
                 raise StateError(f"state.sources.{field_name} 必须是字符串")
             setattr(health, field_name, sanitize_text(value))
         for field_name in ("fail", "skipped", "empty", "last_ok", "alert_at"):
-            value = data.get(field_name, 0)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise StateError(f"state.sources.{field_name} 必须是数字")
-            setattr(health, field_name, int(value))
+            setattr(health, field_name,
+                    _as_int(data.get(field_name, 0), f"state.sources.{field_name}"))
         sent = data.get("alert_sent", {})
         if not isinstance(sent, dict) or not all(
             isinstance(key, str) and isinstance(value, str) for key, value in sent.items()
@@ -111,13 +133,10 @@ class Pending:
         item = Item.from_dict(data["item"])
         if item.key != key:
             raise StateError(f"state.pending.{key} 与条目身份不一致")
-        since = data.get("since", 0)
-        if isinstance(since, bool) or not isinstance(since, (int, float)):
-            raise StateError(f"state.pending.{key}.since 必须是数字")
         return cls(
             item=data["item"],
             fingerprint=sanitize_text(str(data.get("fingerprint") or item.fingerprint)),
-            since=int(since),
+            since=_as_int(data.get("since", 0), f"state.pending.{key}.since"),
             sent=list(dict.fromkeys(sanitize_text(value) for value in sent)),
         )
 
@@ -295,14 +314,8 @@ class State:
             )
 
         state = cls()
-        saved_at = raw.get("saved_at", 0)
-        if isinstance(saved_at, bool) or not isinstance(saved_at, (int, float)):
-            raise StateError("state.saved_at 必须是数字")
-        state.saved_at = int(saved_at)
-        heartbeat = raw.get("heartbeat", 0)
-        if isinstance(heartbeat, bool) or not isinstance(heartbeat, (int, float)):
-            raise StateError("state.heartbeat 必须是数字")
-        state.heartbeat = int(heartbeat)
+        state.saved_at = _as_int(raw.get("saved_at", 0), "state.saved_at")
+        state.heartbeat = _as_int(raw.get("heartbeat", 0), "state.heartbeat")
         sources = raw.get("sources", {})
         if not isinstance(sources, dict):
             raise StateError("state.sources 必须是对象")
@@ -325,9 +338,9 @@ class State:
             raise StateError("state.seen_at 必须是对象")
         state.seen_at = {}
         for key, value in seen_at.items():
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise StateError(f"state.seen_at.{key} 必须是数字")
-            state.seen_at[sanitize_text(str(key))] = int(value)
+            state.seen_at[sanitize_text(str(key))] = _as_int(
+                value, f"state.seen_at.{key}"
+            )
 
         pending = raw.get("pending", {})
         if not isinstance(pending, dict):
@@ -399,7 +412,12 @@ def load_state(path: Path | str) -> State:
     try:
         # Python 的 json 默认接受 NaN/Infinity；它们会让 int()/float 比较
         # 在后续校验里抛 ValueError，必须在解析入口就拒绝。
-        raw = json.loads(text, parse_constant=_reject_json_constant)
+        # parse_float 额外拦住 1e400 这类溢出成 inf 的合法数字。
+        raw = json.loads(
+            text,
+            parse_constant=_reject_json_constant,
+            parse_float=_reject_json_float,
+        )
     except ValueError as exc:
         raise StateError(f"state.json 不是合法 JSON（已停止，避免覆盖基线）：{exc}") from exc
     return State.from_dict(raw)

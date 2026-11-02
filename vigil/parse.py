@@ -17,6 +17,7 @@ from .models import (
     MAX_LINK_CHARS,
     MAX_NODES,
     MAX_SUMMARY_CHARS,
+    MAX_TIMESTAMP,
     MAX_TITLE_CHARS,
     MAX_UID_CHARS,
     Item,
@@ -38,6 +39,8 @@ CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,8}", re.I)
 _TAG = re.compile(r"</?[A-Za-z][^<>]{0,2000}>")
 # 注释单独处理：它不是标签，但也不该出现在摘要里。长度有上限，不会回溯爆炸。
 _COMMENT = re.compile(r"<!--.{0,2000}?-->", re.S)
+# CDATA 是惰性文本：里面的 "<!ENTITY" 只是正文，不是声明。
+_CDATA = re.compile(r"<!\[CDATA\[.*?\]\]>", re.S)
 _IMAGE = re.compile(r"!\[([^\]]{0,200})\]\([^)]{0,500}\)")
 _LINK = re.compile(r"\[([^\]]{0,300})\]\([^)]{0,500}\)")
 _HEADING = re.compile(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+")
@@ -124,7 +127,7 @@ def parse_time(value) -> int:
             return 0
         if stamp > 10**11:  # 毫秒
             stamp //= 1000
-        return stamp if 0 < stamp < 4102444800 else 0
+        return stamp if 0 < stamp < MAX_TIMESTAMP else 0
 
     text = str(value).strip()
     if not text or text.lower() in ("null", "none", "n/a"):
@@ -299,7 +302,21 @@ def build_item(
 
 
 def _cap(items: list[Item]) -> list[Item]:
-    """超大 feed 只保留最新的一批，避免一次解析几千条把内存和 state 撑爆。"""
+    """按 uid 去重，再对超大 feed 只保留最新的一批。
+
+    去重放在这里是因为所有解析器都经过它：同一个 uid 出现两次时，
+    `state.queue` 只会留下后一条，前面的条目会在"共 N 条"里被算进去却永远发不出去。
+    """
+    unique: list[Item] = []
+    seen: set[str] = set()
+    for item in items:
+        if item.key in seen:
+            continue
+        seen.add(item.key)
+        unique.append(item)
+    if len(unique) != len(items):
+        log(f"⚠ 存在重复条目（{len(items)} 条 → {len(unique)} 条），已按 uid 去重")
+    items = unique
     if len(items) <= MAX_NODES:
         return items
     ranked = sorted(items, key=lambda item: item.published or 2**31, reverse=True)
@@ -311,6 +328,17 @@ def _cap(items: list[Item]) -> list[Item]:
 
 # 自定义实体声明：正规订阅源不需要，出现即视为攻击面
 _ENTITY_DECL = re.compile(r"<!ENTITY", re.I)
+
+
+def _has_entity_declaration(payload: str) -> bool:
+    """只在真正的标记里找 <!ENTITY。
+
+    CDATA 和注释里的 "<!ENTITY" 只是正文——安全公告完全可能在讨论 XML 实体攻击，
+    把这种源永久判成攻击会静默丢掉整条流。真正的实体声明不可能藏在 CDATA 里生效，
+    所以先剔除惰性文本再判断是安全的。
+    """
+    markup = _CDATA.sub("", _COMMENT.sub("", payload))
+    return bool(_ENTITY_DECL.search(markup))
 
 
 def _local(tag: str) -> str:
@@ -350,7 +378,7 @@ def parse_rss(text: str, source: Source) -> list[Item]:
         raise ParseError("响应为空")
     # ElementTree 会展开内部实体，深层嵌套可以指数级放大内存（billion laughs）。
     # 正规 feed 不需要自定义实体，看到就直接拒绝，而不是把 runner 撑爆。
-    if _ENTITY_DECL.search(payload):
+    if _has_entity_declaration(payload):
         raise ParseError("响应里包含自定义 XML 实体（<!ENTITY>），已拒绝解析")
     try:
         root = ET.fromstring(payload)
@@ -477,26 +505,44 @@ def parse_json(text: str, source: Source) -> list[Item]:
         raise ParseError(f"JSON 解析失败：{exc}") from exc
 
     mapping = source.mapping
-    rows = dig(data, mapping.get("path", ""))
+
+    def field(name: str, default: str) -> str:
+        """取映射路径；空字符串视为"没配"，回落到默认字段名。
+
+        `dig(row, "")` 会返回整行对象，直接把整行 JSON dump 成标题——
+        配置里少写一个值就变成一堆垃圾标题，所以这里必须先归一化。
+        """
+        return mapping.get(name, "").strip() or default
+
+    path = mapping.get("path", "").strip()
+    rows = dig(data, path)
     if not isinstance(rows, list):
-        raise ParseError(f"json.path={mapping.get('path', '')!r} 没指向数组，请检查字段映射")
+        raise ParseError(f"json.path={path!r} 没指向数组，请检查字段映射")
+
+    title_path = field("title", "title")
+    link_path = field("link", "link")
+    id_path = field("id", "id")
+    summary_path = field("summary", "summary")
+    date_path = field("date", "date")
+    cve_path = mapping.get("cve", "").strip()
 
     items: list[Item] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
-        title = _as_text(dig(row, mapping.get("title", "title")))
-        link = _as_text(dig(row, mapping.get("link", "link")))
-        uid = _as_text(dig(row, mapping.get("id", "id"))) or link or title
-        cve_field = _as_text(dig(row, mapping["cve"])) if mapping.get("cve") else ""
+        title = _as_text(dig(row, title_path))
+        link = _as_text(dig(row, link_path))
+        uid = _as_text(dig(row, id_path)) or link or title
+        cve_field = _as_text(dig(row, cve_path)) if cve_path else ""
+        summary = _as_text(dig(row, summary_path))
         item = build_item(
             source,
             uid=uid,
             title=title,
             link=link,
-            published=parse_time(dig(row, mapping.get("date", "date"))),
-            summary=_as_text(dig(row, mapping.get("summary", "summary"))),
-            cves=_cves(title, _as_text(dig(row, mapping.get("summary", "summary"))), cve_field),
+            published=parse_time(dig(row, date_path)),
+            summary=summary,
+            cves=_cves(title, summary, cve_field),
         )
         if item:
             items.append(item)
@@ -560,8 +606,6 @@ def parse_nginx(text: str, source: Source) -> list[Item]:
         if not title or "severity" not in raw.lower():
             continue
         cves = _cves(raw)
-        if not cves:
-            continue
         details = []
         for part in parts[1:]:
             detail = clean(_LINK_TAG.sub(r"\1", part))
@@ -577,10 +621,13 @@ def parse_nginx(text: str, source: Source) -> list[Item]:
         href = _A_HREF.search(raw)
         link = href.group(1).strip() if href else ""
         if not link.lower().startswith(("http://", "https://")):
-            link = f"https://www.cve.org/CVERecord?id={cves[0]}"
+            link = f"https://www.cve.org/CVERecord?id={cves[0]}" if cves else ""
+        # 没有 CVE 的公告（例如厂商内部编号）也要推：uid 退回链接，再退回标题。
+        # 以前直接 continue，最新的公告只要没写 CVE 就会被静默漏掉。
+        uid = cves[0] if cves else (link or title)
         item = build_item(
             source,
-            uid=cves[0],
+            uid=uid,
             title=title,
             link=link,
             summary=summary,

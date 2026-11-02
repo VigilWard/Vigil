@@ -55,6 +55,9 @@ PENDING_TTL = 7 * 86400          # 待送达队列最长保留时间
 MAX_PENDING = 300                # 待送达队列硬上限
 # 公开仓库连续 60 天没有提交会被停掉定时任务；即使没有新条目也每周留一次心跳提交
 HEARTBEAT = 7 * 86400
+# 时间戳的合理上限（2100-01-01）。超过一律当成"无日期"，避免手工改坏的
+# state 里出现 1e400 / 10**400 这类值后进入排序、JSON 和消息头。
+MAX_TIMESTAMP = 4102444800
 
 # ---------------------------------------------------------------- 渲染
 MAX_TEXT_BYTES = 18000           # 纯文本消息的正文预算（飞书请求体上限 20KB）
@@ -205,21 +208,33 @@ class Item:
         self.title = sanitize_text(self.title)
         self.link = sanitize_text(self.link)
         self.summary = sanitize_text(self.summary)
+        # 字符串是"一个元素"而不是字符序列；直接构造时传 "CVE-..." 不能被拆成单字。
+        if isinstance(self.cves, str):
+            self.cves = (self.cves,)
+        if isinstance(self.also, str):
+            self.also = (self.also,)
+        if isinstance(self.merged, str):
+            self.merged = (self.merged,)
         self.cves = tuple(sanitize_text(cve) for cve in self.cves)
         self.title_zh = sanitize_text(self.title_zh)
         self.summary_zh = sanitize_text(self.summary_zh)
         self.also = tuple(sanitize_text(name) for name in self.also)
         self.merged = tuple(sanitize_text(key) for key in self.merged)
         # 直接构造的 Item 也做一次范围兜底，避免把非法值写进 state。
+        # OverflowError 必须单独接住：float("inf") / 10**400 这类值转 int 会抛它，
+        # 而它不属于 ValueError，漏掉就会让整轮在构造阶段 traceback。
         try:
             self.published = int(self.published)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.published = 0
-        if self.severity not in (0, 1, 2, 3, 4):
+        if not 0 <= self.published < MAX_TIMESTAMP:
+            self.published = 0
+        # bool 是 int 的子类，True 不能当成等级 1。
+        if isinstance(self.severity, bool) or self.severity not in (0, 1, 2, 3, 4):
             self.severity = 0
         try:
             self.cvss = float(self.cvss)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.cvss = 0.0
         if not math.isfinite(self.cvss) or not 0 <= self.cvss <= 10:
             self.cvss = 0.0
@@ -272,8 +287,22 @@ class Item:
         if not isinstance(data, dict):
             raise StateError("state 中的条目必须是对象")
         try:
+            # 类型必须严格校验：state 可能被手工编辑过，
+            # bool("false") 是 True、str(None) 是 "None" 这类静默转换会把脏数据发到群里。
+            for name in ("source_key", "source_name", "uid", "title"):
+                if not isinstance(data.get(name), str):
+                    raise ValueError(f"{name} 必须是字符串")
+            for name in ("link", "summary", "title_zh", "summary_zh"):
+                if not isinstance(data.get(name, ""), str):
+                    raise ValueError(f"{name} 必须是字符串")
+            for name in ("exploited", "ransomware"):
+                if type(data.get(name, False)) is not bool:
+                    raise ValueError(f"{name} 必须是布尔值")
             published = int(data.get("published", 0) or 0)
-            severity = int(data.get("severity", 0) or 0)
+            raw_severity = data.get("severity", 0)
+            if isinstance(raw_severity, bool):
+                raise ValueError("severity 不能是布尔值")
+            severity = int(raw_severity or 0)
             cvss = float(data.get("cvss", 0) or 0)
             raw_cves = data.get("cves", ())
             raw_also = data.get("also", ())
@@ -281,28 +310,34 @@ class Item:
                 raise ValueError("cves 必须是数组")
             if not isinstance(raw_also, (list, tuple)):
                 raise ValueError("also 必须是数组")
+            if not all(isinstance(x, str) for x in raw_cves):
+                raise ValueError("cves 的每一项都必须是字符串")
+            if not all(isinstance(x, str) for x in raw_also):
+                raise ValueError("also 的每一项都必须是字符串")
+            if not 0 <= published < MAX_TIMESTAMP:
+                raise ValueError(f"published 超出合理范围：{published}")
             if severity not in (0, 1, 2, 3, 4):
                 raise ValueError(f"severity 超出 0~4：{severity}")
             if not math.isfinite(cvss) or not 0 <= cvss <= 10:
                 raise ValueError(f"cvss 超出 0~10：{cvss}")
             return cls(
-                source_key=str(data["source_key"]),
-                source_name=str(data["source_name"]),
-                uid=str(data["uid"]),
-                title=str(data["title"]),
-                link=str(data.get("link", "")),
+                source_key=data["source_key"],
+                source_name=data["source_name"],
+                uid=data["uid"],
+                title=data["title"],
+                link=data.get("link", ""),
                 published=published,
-                summary=str(data.get("summary", "")),
-                cves=tuple(str(x) for x in raw_cves),
-                exploited=bool(data.get("exploited", False)),
-                ransomware=bool(data.get("ransomware", False)),
+                summary=data.get("summary", ""),
+                cves=tuple(raw_cves),
+                exploited=data.get("exploited", False),
+                ransomware=data.get("ransomware", False),
                 severity=severity,
                 cvss=cvss,
-                title_zh=str(data.get("title_zh", "")),
-                summary_zh=str(data.get("summary_zh", "")),
-                also=tuple(str(x) for x in raw_also),
+                title_zh=data.get("title_zh", ""),
+                summary_zh=data.get("summary_zh", ""),
+                also=tuple(raw_also),
             )
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise StateError(f"state 中的条目字段无效：{exc}") from exc
 
 

@@ -151,6 +151,21 @@ class TestBasics(FlowCase):
         self.assertIn("新条目", text)
         self.assertIn("队列里还有 1 条", text)
 
+    def test_dry_run_does_not_duplicate_superseded_pending(self):
+        """队列里的旧版本会被这一轮的新版本替换，预览不能把两版都打印出来。"""
+        self.run_main()
+        self.feed = build_rss([("g2", "第一版公告", "d")])
+        self.fail_for = {self.webhook}
+        self.assertEqual(self.run_main(), 1)
+
+        self.fail_for = set()
+        self.feed = build_rss([("g2", "第二版公告", "d")])
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.run_main("--dry-run"), 0)
+        text = output.getvalue()
+        self.assertIn("第二版公告", text)
+        self.assertNotIn("第一版公告", text)
+
     def test_reset_clears_baseline(self):
         self.run_main()
         self.assertEqual(self.run_main("--reset"), 0)
@@ -360,6 +375,24 @@ class TestPendingLifecycle(FlowCase):
         self.run_main()
         self.run_main()
         self.assertEqual(len(self.posts), 1)
+
+
+class TestPagination(FlowCase):
+    def test_multiple_pages_are_sent_and_acked_per_page(self):
+        """端到端验证：分页后每一页都真的发出去、并只确认自己那一页。"""
+        self.run_main()
+        self.feed = build_rss([
+            (f"n{i}", f"公告 {i} " + "标题" * 30, "描述" * 80) for i in range(12)
+        ])
+        with mock.patch("vigil.app.MAX_CARD_BODY_BYTES", 900):
+            self.assertEqual(self.run_main(), 0)
+
+        self.assertGreater(len(self.posts), 1, "预算这么小，应该分成多页")
+        state = self.state()
+        self.assertGreater(len(state["seen"]), 1)
+        self.assertGreater(len(state["pending"]), 0)
+        # 基线 1 条 + 新条目 12 条：要么已送达，要么还在队列，不能凭空消失
+        self.assertEqual(len(state["seen"]) + len(state["pending"]), 13)
 
 
 if __name__ == "__main__":

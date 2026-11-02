@@ -103,6 +103,12 @@ class TestSource(ConfigCase):
     def test_unknown_source_key(self):
         self._rejects({"sources": [{"name": "a", "url": "https://a.test", "ttl": 1}]}, "未知字段")
 
+    def test_control_chars_in_url_rejected(self):
+        self._rejects({"sources": [{"name": "a", "url": "https://a.test/\nfoo"}]}, "控制字符")
+
+    def test_control_chars_in_name_rejected(self):
+        self._rejects({"sources": [{"name": "a\x00b", "url": "https://a.test"}]}, "控制字符")
+
 
 class TestJsonMapping(ConfigCase):
     def test_json_kind_requires_mapping(self):
@@ -130,23 +136,32 @@ class TestEnvExpansion(ConfigCase):
     def test_headers_expanded(self):
         payload = {"sources": [{
             "name": "a", "url": "https://a.test/1",
-            "headers": {"Authorization": "Bearer ${TEST_VENDOR_TOKEN}"}}]}
-        with mock.patch.dict(os.environ, {"TEST_VENDOR_TOKEN": "s3cret"}):
+            "headers": {"Authorization": "Bearer ${VIGIL_TEST_VENDOR_TOKEN}"}}]}
+        with mock.patch.dict(os.environ, {"VIGIL_TEST_VENDOR_TOKEN": "s3cret"}):
             source = self._load(payload).sources[0]
         self.assertEqual(source.headers["Authorization"], "Bearer s3cret")
 
     def test_url_expanded(self):
-        payload = {"sources": [{"name": "a", "url": "${TEST_FEED_URL}"}]}
-        with mock.patch.dict(os.environ, {"TEST_FEED_URL": "https://a.test/1"}):
+        payload = {"sources": [{"name": "a", "url": "${VIGIL_TEST_FEED_URL}"}]}
+        with mock.patch.dict(os.environ, {"VIGIL_TEST_FEED_URL": "https://a.test/1"}):
             self.assertEqual(self._load(payload).sources[0].url, "https://a.test/1")
 
     def test_missing_env_rejected(self):
         payload = {"sources": [{"name": "a", "url": "https://a.test/1",
-                                "headers": {"Authorization": "Bearer ${NOT_SET_ANYWHERE}"}}]}
+                                "headers": {"Authorization": "Bearer ${VIGIL_NOT_SET_ANYWHERE}"}}]}
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("NOT_SET_ANYWHERE", None)
+            os.environ.pop("VIGIL_NOT_SET_ANYWHERE", None)
             with self.assertRaises(ConfigError):
                 self._load(payload)
+
+    def test_other_prefix_is_rejected(self):
+        """配置不能引用工具自身的密钥（FEISHU_SECRET / BAIDU_KEY 等）。"""
+        payload = {"sources": [{"name": "a", "url": "https://a.test/1",
+                                "headers": {"X-Token": "${FEISHU_SECRET}"}}]}
+        with mock.patch.dict(os.environ, {"FEISHU_SECRET": "leak"}), \
+                self.assertRaises(ConfigError) as ctx:
+            self._load(payload)
+        self.assertIn("VIGIL_", str(ctx.exception))
 
 
 class TestFile(unittest.TestCase):
@@ -160,6 +175,39 @@ class TestFile(unittest.TestCase):
             path.write_text("{not json", encoding="utf-8")
             with self.assertRaises(ConfigError):
                 load_config(path)
+
+
+class TestPrivateHosts(ConfigCase):
+    def test_private_address_is_rejected(self):
+        for url in ("http://127.0.0.1/feed", "http://10.0.0.1/feed",
+                    "http://169.254.169.254/latest", "http://localhost/feed"):
+            with self.subTest(url=url):
+                with self.assertRaises(ConfigError) as ctx:
+                    self._load({"sources": [{"name": "a", "url": url}]})
+                self.assertIn("私网", str(ctx.exception))
+
+    def test_escape_hatch_allows_private_address(self):
+        with mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}):
+            config = self._load({"sources": [{"name": "a", "url": "http://127.0.0.1/feed"}]})
+        self.assertEqual(len(config.sources), 1)
+
+
+class TestJsonMappingValidation(ConfigCase):
+    def test_empty_mapping_value_is_rejected(self):
+        """留空会退化成 dig(row, "")，把整行 JSON dump 成标题。"""
+        with self.assertRaises(ConfigError) as ctx:
+            self._load({"sources": [{
+                "name": "a", "url": "https://a.test", "kind": "json",
+                "json": {"title": "", "id": "id"},
+            }]})
+        self.assertIn("json.title", str(ctx.exception))
+
+    def test_empty_path_is_allowed(self):
+        config = self._load({"sources": [{
+            "name": "a", "url": "https://a.test", "kind": "json",
+            "json": {"path": "", "title": "name"},
+        }]})
+        self.assertEqual(config.sources[0].mapping["path"], "")
 
 
 if __name__ == "__main__":

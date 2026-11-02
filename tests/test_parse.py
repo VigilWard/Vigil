@@ -224,7 +224,7 @@ class TestNginx(unittest.TestCase):
 
     def test_parse(self):
         items = parse_nginx(self.HTML, self._src())
-        self.assertEqual(len(items), 1)
+        self.assertEqual(len(items), 2)
         item = items[0]
         self.assertEqual(item.uid, "CVE-2026-15176")
         self.assertEqual(item.title, "Buffer overflow when using alias with rewrite")
@@ -233,9 +233,50 @@ class TestNginx(unittest.TestCase):
         self.assertNotIn("Advisory", item.summary)
         self.assertEqual(item.published, 0)
 
+    def test_advisory_without_cve_is_kept(self):
+        """没有 CVE 的公告也要推；以前直接 continue，最新的公告会被静默漏掉。"""
+        item = parse_nginx(self.HTML, self._src())[1]
+        self.assertEqual(item.uid, "Simple notice without CVE")
+        self.assertEqual(item.severity, 1)
+        self.assertEqual(item.cves, ())
+
     def test_structure_change_detected(self):
         with self.assertRaises(ParseError):
             parse_nginx("<html><body>nothing</body></html>", self._src())
+
+
+class TestRssEntities(unittest.TestCase):
+    def test_entity_text_inside_cdata_is_not_a_bomb(self):
+        """安全公告可能在正文里讨论 <!ENTITY 写法，CDATA 里只是文本。"""
+        rss = ('<?xml version="1.0"?><rss version="2.0"><channel><item>'
+               "<title>XML 实体攻击分析</title><guid>1</guid>"
+               "<description><![CDATA[示例 <!ENTITY 写法]]></description>"
+               "</item></channel></rss>")
+        self.assertEqual(len(parse_rss(rss, SRC)), 1)
+
+    def test_real_entity_declaration_is_still_rejected(self):
+        bomb = ('<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "b">]>'
+                '<rss version="2.0"><channel><item><title>&a;</title><guid>1</guid>'
+                "</item></channel></rss>")
+        with self.assertRaises(ParseError):
+            parse_rss(bomb, SRC)
+
+
+class TestJsonDuplicates(unittest.TestCase):
+    def test_duplicate_ids_are_deduped(self):
+        payload = json.dumps([
+            {"id": "1", "title": "第一条"},
+            {"id": "1", "title": "第二条"},
+        ])
+        items = parse_json(payload, Source("J", "https://a.test", kind="json", mapping={}))
+        self.assertEqual([item.title for item in items], ["第一条"])
+
+    def test_empty_mapping_value_uses_default_field(self):
+        """空映射值不能把整行 JSON 当成标题（配置校验会拦，直接构造也要兜底）。"""
+        source = Source("J", "https://a.test", kind="json",
+                        mapping={"title": "", "id": "id"})
+        payload = json.dumps([{"id": "1", "title": "正常标题"}])
+        self.assertEqual(parse_json(payload, source)[0].title, "正常标题")
 
 
 if __name__ == "__main__":

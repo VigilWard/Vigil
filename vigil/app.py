@@ -338,12 +338,17 @@ def cmd_run(config: Config, state: State, state_path) -> int:
 
 
 def cmd_dry_run(config: Config, state_path) -> int:
-    state = load_state(state_path) if Path(state_path).exists() else State()
+    # load_state 本身就会在文件不存在时返回空状态，不需要再判断一次
+    state = load_state(state_path)
     now = int(time.time())
     report = collect(config, state, now, deadline=time.monotonic() + FETCH_BUDGET, preview=True)
 
-    # 下一轮真正会发的，是"这轮新抓到的"加上"队列里还没送达的"
+    # 下一轮真正会发的，是"这轮新抓到的"加上"队列里还没送达的"。
+    # 同一个 key 如果内容变了，state.queue 会用新版本替换队列里的旧版本，
+    # 所以预览时也要先剔掉旧版本，否则同一条公告会打印两遍。
     pending = state.pending_items()
+    fresh_keys = {item.key for item in report.items}
+    pending = [item for item in pending if item.key not in fresh_keys]
     items = merge(report.items + pending, config)
 
     for failure in report.failures:

@@ -191,5 +191,65 @@ class TestRetention(StateCase):
         self.assertIn(item.key, state.seen)
 
 
+class TestNonFiniteNumbers(StateCase):
+    """1e400 是合法 JSON 数字，但 float() 会得到 inf，int(inf) 会抛 OverflowError。
+
+    必须在解析入口拦成 StateError，否则 watch.py 会 traceback、退出码变成 1。
+    """
+
+    def _load_text(self, text: str):
+        self.path.write_text(text, encoding="utf-8")
+        return load_state(self.path)
+
+    def test_overflowing_float_at_top_level(self):
+        with self.assertRaises(StateError) as ctx:
+            self._load_text('{"version": 2, "saved_at": 1e400}')
+        self.assertIn("非有限", str(ctx.exception))
+
+    def test_overflowing_float_in_seen_at(self):
+        with self.assertRaises(StateError):
+            self._load_text('{"version": 2, "seen_at": {"s:1": 1e400}}')
+
+    def test_overflowing_float_in_pending_item(self):
+        # 手写 JSON：json.dumps(float("inf")) 会输出 Infinity，
+        # 那会被 parse_constant 拦住，测不到 1e400 这条路径。
+        item = {**make_item().to_dict(), "published": 1000}
+        item_json = json.dumps(item, ensure_ascii=False).replace('"published": 1000', '"published": 1e400')
+        text = (
+            '{"version": 2, "pending": {"s:1": {"item": '
+            + item_json
+            + ', "fingerprint": "x", "since": 1, "sent": []}}}'
+        )
+        with self.assertRaises(StateError) as ctx:
+            self._load_text(text)
+        self.assertIn("非有限", str(ctx.exception))
+
+    def test_huge_integer_published_is_rejected(self):
+        """10**400 是合法整数（不会溢出），但时间戳明显不合理，state 应判为无效。"""
+        with self.assertRaises(StateError):
+            Item.from_dict({**make_item().to_dict(), "published": 10**400})
+
+
+class TestStrictItemFields(StateCase):
+    BASE = {"source_key": "s", "source_name": "源", "uid": "1", "title": "标题"}
+
+    def test_string_false_is_not_a_bool(self):
+        """bool("false") 是 True；state 里的布尔字段必须真的是布尔值。"""
+        with self.assertRaises(StateError):
+            Item.from_dict({**self.BASE, "exploited": "false"})
+
+    def test_null_title_is_rejected(self):
+        with self.assertRaises(StateError):
+            Item.from_dict({**self.BASE, "title": None})
+
+    def test_null_link_is_rejected(self):
+        with self.assertRaises(StateError):
+            Item.from_dict({**self.BASE, "link": None})
+
+    def test_non_string_cve_is_rejected(self):
+        with self.assertRaises(StateError):
+            Item.from_dict({**self.BASE, "cves": [123]})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,35 +1,14 @@
 """飞书推送：签名、响应判定、重试策略与卡片封装。"""
-import io
 import json
 import unittest
-import urllib.error
 from unittest import mock
 
+from tests.support import FakeResponse, http_error
 from vigil import feishu
 from vigil.models import MAX_CARD_BODY_BYTES, Config, Item, PushError, PushTarget, Source
 from vigil.render import Page, card_template, compose
 
 TARGET = PushTarget("https://open.feishu.cn/open-apis/bot/v2/hook/xxx", "my-secret")
-
-
-class FakeResponse:
-    def __init__(self, body: bytes):
-        self._body = io.BytesIO(body)
-        self.headers: dict[str, str] = {}
-
-    def read(self, size=None):
-        return self._body.read(size)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-def http_error(code: int) -> urllib.error.HTTPError:
-    # 第 4 个参数官方类型是 email.message.Message，dict 在运行期一样能用
-    return urllib.error.HTTPError("https://hook.test/x", code, "err", {}, io.BytesIO(b""))  # type: ignore[arg-type]
 
 
 class TestSign(unittest.TestCase):

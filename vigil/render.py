@@ -201,11 +201,11 @@ def build_sections(config: Config, items: list[Item]):
                 key=lambda item: (-item.severity, -item.published, item.title),
             )
             source = sources.get(skey)
-            limit = (source.limit or config.max_items) if source else MAX_ITEMS
+            # 至少展示 1 条：limit 为 0/负数只可能来自直接构造的 Source，
+            # 真按它切片会让这一组永远显示"另有 N 条"却一条都发不出去。
+            limit = max(1, (source.limit or config.max_items) if source else MAX_ITEMS)
             shown = values[:limit]
             # 源被从 config 里删掉时（条目还在队列里）用条目自带的源名兜底。
-            # 注意取 values[0] 而不是 shown[0]：limit 理论上可能小于 1，
-            # 那时 shown 是空列表，shown[0] 会直接 IndexError。
             name = source.name if source else values[0].source_name
             groups.append((name, shown, len(values) - len(shown)))
         if groups:
@@ -317,22 +317,17 @@ def compose(
                 # "上一页只剩标题、条目全在下一页"的孤儿标题。
                 header = f"{section}\n{header}"
                 first_group = False
-            if values:
-                first = values[0]
-                blocks.append((
-                    header + "\n" + render_item(first, markup=markup) + "\n",
-                    [first.key, *first.merged],
-                ))
-                for item in values[1:]:
-                    # 条目自带结尾空行：块与块之间自然隔开，源标题紧跟第一个条目
-                    blocks.append((render_item(item, markup=markup) + "\n",
-                                   [item.key, *item.merged]))
-            else:
-                blocks.append((header, []))
+            # build_sections 保证每组至少 1 条，这里不需要空组兜底。
+            first = values[0]
+            blocks.append((
+                header + "\n" + render_item(first, markup=markup) + "\n",
+                [first.key],
+            ))
+            for item in values[1:]:
+                # 条目自带结尾空行：块与块之间自然隔开，源标题紧跟第一个条目
+                blocks.append((render_item(item, markup=markup) + "\n", [item.key]))
             if hidden > 0:
                 blocks.append((f"…另有{hidden}条未列出，将顺延到后续轮次\n", []))
-        if first_group:
-            blocks.append((section, []))
 
     title = f"Vigil · {datetime.fromtimestamp(now, CST):%m-%d %H:%M}"
     exploited = sum(1 for item in items if item.exploited)
@@ -342,6 +337,9 @@ def compose(
         subtitle += f" · 含 {exploited} 条在野利用"
 
     by_key = {item.key: item for item in items}
+    # 合并条目：分页时只按"看得见的条目"计数，确认送达时再把被合并的 key 一起带上。
+    # 否则 overflow 会把一个条目的两个 key 算成两条，副标题里的"另有 N 条"会虚高。
+    merged_by_key = {item.key: item.merged for item in items if item.merged}
     raw_pages, overflow = paginate(blocks, budget, MAX_PAGES)
     total = len(raw_pages)
     pages = []
@@ -352,6 +350,9 @@ def compose(
         if overflow and index == total:
             page_subtitle += f" · 另有 {overflow} 条顺延到下一轮"
         page_items = [by_key[key] for key in keys if key in by_key]
-        pages.append(Page(title, page_subtitle, body.rstrip("\n"), keys,
+        ack_keys = list(keys)
+        for key in keys:
+            ack_keys.extend(merged_by_key.get(key, ()))
+        pages.append(Page(title, page_subtitle, body.rstrip("\n"), ack_keys,
                           card_template(page_items)))
     return pages

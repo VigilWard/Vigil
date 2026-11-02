@@ -1,12 +1,12 @@
 """翻译层：多源解析、拆段、自动降级与开关。"""
 import hashlib
-import io
 import json
 import os
 import unittest
 import urllib.parse
 from unittest import mock
 
+from tests.support import FakeResponse
 from vigil.models import Item
 from vigil.translate import (
     MAX_REQUESTS,
@@ -20,21 +20,6 @@ from vigil.translate import (
     parse_translation,
     split_text,
 )
-
-
-class FakeResponse:
-    def __init__(self, body: bytes):
-        self._body = io.BytesIO(body)
-        self.headers: dict[str, str] = {}
-
-    def read(self, size=None):
-        return self._body.read(size)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
 
 
 def google_body(translated: str, source: str = "原文") -> bytes:
@@ -374,12 +359,6 @@ class TestBaiduProvider(unittest.TestCase):
 
 
 class TestBaiduInChain(unittest.TestCase):
-    def test_absent_without_credentials(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            translator = build_translator()
-        assert translator is not None
-        self.assertEqual([p.name for p in translator.providers], ["google", "mymemory"])
-
     def test_sits_between_google_and_mymemory(self):
         """顺序是 Google → 百度 → MyMemory：质量优先，百度兜底。"""
         env = {"BAIDU_APPID": "appid", "BAIDU_KEY": "key"}

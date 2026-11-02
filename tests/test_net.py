@@ -1,40 +1,17 @@
 """HTTP 层：字节上限、编码嗅探、条件请求与重定向策略。"""
 import gzip
 import io
+import time
 import unittest
 import urllib.error
 import urllib.request
-from typing import Any
+import zlib
+from email.utils import formatdate
 from unittest import mock
 
+from tests.support import FakeResponse, http_error
 from vigil import net
-from vigil.models import FetchError, NotModified
-
-
-class FakeResponse:
-    def __init__(self, body: bytes, headers: dict[str, str] | None = None, status: int = 200):
-        self._body = io.BytesIO(body)
-        self.headers: dict[str, str] = headers or {}
-        self.status = status
-
-    def read(self, size=None):
-        return self._body.read(size)
-
-    def getheaders(self):
-        return list(self.headers.items())
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-def http_error(code: int, headers: Any = None) -> urllib.error.HTTPError:
-    # 第 4 个参数官方类型是 email.message.Message，但 dict 在运行期一样能用；
-    # 用 Any 免掉测试里的类型噪音
-    return urllib.error.HTTPError("https://a.test/x", code, "err",
-                                  headers or {}, io.BytesIO(b""))  # type: ignore[arg-type]
+from vigil.models import BudgetExceeded, DecodeError, FetchError, NotModified
 
 
 class TestDecode(unittest.TestCase):
@@ -161,6 +138,106 @@ class TestOrigin(unittest.TestCase):
     def test_default_ports(self):
         self.assertEqual(net._origin("https://a.test/x"), ("https", "a.test", 443))
         self.assertEqual(net._origin("http://a.test/x"), ("http", "a.test", 80))
+
+
+class TestDecodeCorruption(unittest.TestCase):
+    """一个坏字节不能把整篇 UTF-8 变成另一种编码的乱码。"""
+
+    TEXT = "这是一个包含中文的安全公告标题，用于测试编码嗅探的健壮性。" * 3
+
+    def _corrupted(self) -> bytes:
+        raw = self.TEXT.encode("utf-8")
+        return raw[:10] + b"\xff" + raw[11:]
+
+    def test_declared_utf8_with_one_bad_byte_stays_readable(self):
+        text = net.decode_bytes(self._corrupted(), "utf-8")
+        self.assertIn("这是一个", text)
+        self.assertIn("健壮性", text)
+        self.assertLessEqual(text.count("\ufffd"), 3)
+
+    def test_undeclared_utf8_with_one_bad_byte_stays_readable(self):
+        text = net.decode_bytes(self._corrupted())
+        self.assertIn("这是一个", text)
+        self.assertIn("健壮性", text)
+        self.assertLessEqual(text.count("\ufffd"), 3)
+
+    def test_lying_utf8_declaration_falls_back_to_gbk(self):
+        """声明 UTF-8、实际是 GBK 时，坏字节很多，必须继续尝试 GBK。"""
+        raw = self.TEXT.encode("gbk")
+        self.assertEqual(net.decode_bytes(raw, "utf-8"), self.TEXT)
+
+
+class TestDeflateIntegrity(unittest.TestCase):
+    def test_truncated_stream_is_a_decode_error(self):
+        raw = zlib.compress(b"abc" * 1000)
+        with self.assertRaises(DecodeError):
+            net._decompress(raw[:20], "deflate", None)
+
+    def test_trailing_garbage_is_ignored(self):
+        raw = zlib.compress(b"abc") + b"garbage"
+        self.assertEqual(net._decompress(raw, "deflate", None), b"abc")
+
+
+class TestRetryAfterDate(unittest.TestCase):
+    def test_http_date_is_converted_to_seconds(self):
+        value = formatdate(time.time() + 30, usegmt=True)
+        wait = net.retry_after({"Retry-After": value})
+        assert wait is not None
+        self.assertGreater(wait, 20)
+        self.assertLessEqual(wait, 30)
+
+    def test_past_http_date_is_zero(self):
+        value = formatdate(time.time() - 30, usegmt=True)
+        self.assertEqual(net.retry_after({"Retry-After": value}), 0.0)
+
+    def test_garbage_is_none(self):
+        self.assertIsNone(net.retry_after({"Retry-After": "soon"}))
+
+
+class TestRedirectHeaders(unittest.TestCase):
+    def test_same_host_https_upgrade_keeps_headers(self):
+        handler = net.SafeRedirectHandler()
+        request = urllib.request.Request("http://a.test/x", headers={"Authorization": "Bearer t"})
+        new = handler.redirect_request(request, None, 301, "Moved", {}, "https://a.test/x")
+        self.assertEqual(new.headers.get("Authorization"), "Bearer t")
+
+    def test_cross_host_still_strips_headers(self):
+        handler = net.SafeRedirectHandler()
+        request = urllib.request.Request("http://a.test/x", headers={"Authorization": "Bearer t"})
+        new = handler.redirect_request(request, None, 301, "Moved", {}, "https://b.test/x")
+        self.assertIsNone(new.headers.get("Authorization"))
+
+
+class TestPrivateHost(unittest.TestCase):
+    def test_fetch_refuses_private_host(self):
+        with mock.patch("vigil.net.open_url") as opener, \
+                self.assertRaises(FetchError) as ctx:
+            net.fetch("http://127.0.0.1/feed")
+        opener.assert_not_called()
+        self.assertIn("私网", str(ctx.exception))
+
+    def test_escape_hatch_allows_private_host(self):
+        response = FakeResponse(b"ok")
+        with mock.patch.dict("os.environ", {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}), \
+                mock.patch("vigil.net.open_url", lambda *a, **k: response):
+            self.assertEqual(net.fetch("http://127.0.0.1/feed").text, "ok")
+
+
+class TestFetchBudget(unittest.TestCase):
+    def test_budget_exhausted_during_backoff_is_not_a_failure(self):
+        """等不起退避时这一轮没检查完，应报预算跳过，而不是记成抓取失败。"""
+        error = http_error(503)
+        with mock.patch("vigil.net.open_url", side_effect=error) as opener, \
+                self.assertRaises(BudgetExceeded):
+            net.fetch("https://a.test/x", deadline=time.monotonic() + 0.5)
+        self.assertEqual(opener.call_count, 1)
+
+    def test_error_message_reports_real_attempts(self):
+        error = http_error(503)
+        with mock.patch("vigil.net.open_url", side_effect=error) as opener, \
+                mock.patch("time.sleep"), self.assertRaises(FetchError) as ctx:
+            net.fetch("https://a.test/x")
+        self.assertIn(f"已尝试 {opener.call_count} 次", str(ctx.exception))
 
 
 if __name__ == "__main__":

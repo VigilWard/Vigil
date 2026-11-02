@@ -14,6 +14,16 @@ import sys
 
 LOCAL = {"vigil", "tests", "tools", "watch"}
 
+# 这些目录里的 .py 不是项目代码：虚拟环境、缓存、构建产物、预览输出。
+# 不排除 .venv 的话，本地建过虚拟环境再跑这个脚本就会把 site-packages 当成
+# "项目引入了第三方依赖"，CI 绿、本地红，非常误导。
+SKIP_DIRS = frozenset({
+    "__pycache__", ".git", ".hg", ".svn",
+    ".venv", "venv", "env", ".tox", ".nox",
+    ".mypy_cache", ".ruff_cache", ".pytest_cache",
+    "node_modules", "build", "dist", "preview",
+})
+
 
 def imported_roots(tree: ast.AST) -> list[str]:
     roots: list[str] = []
@@ -25,23 +35,28 @@ def imported_roots(tree: ast.AST) -> list[str]:
     return roots
 
 
-def main() -> int:
+def find_violations(root: pathlib.Path) -> list[str]:
+    """返回形如 ``path: 包名`` 的违规列表；空列表表示只用了标准库。"""
     stdlib = set(sys.stdlib_module_names)
     bad: list[str] = []
-    for path in sorted(pathlib.Path(".").rglob("*.py")):
-        if "__pycache__" in path.parts:
+    for path in sorted(root.rglob("*.py")):
+        if SKIP_DIRS.intersection(path.parts):
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except SyntaxError as exc:
-            print(f"{path}: 语法错误 {exc}")
-            return 1
+            bad.append(f"{path}: 语法错误 {exc}")
+            continue
         for name in imported_roots(tree):
             if name not in stdlib and name not in LOCAL:
                 bad.append(f"{path}: {name}")
+    return bad
 
+
+def main() -> int:
+    bad = find_violations(pathlib.Path("."))
     if bad:
-        print("引入了第三方依赖：")
+        print("依赖检查未通过：")
         print("\n".join(bad))
         return 1
     print("依赖检查通过：只用标准库")
