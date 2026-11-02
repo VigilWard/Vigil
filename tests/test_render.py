@@ -33,18 +33,18 @@ class TestRenderItem(unittest.TestCase):
         text = render_item(make_item(1, summary="摘要", cves=("CVE-2026-1111",)), markup=False)
         lines = text.splitlines()
         self.assertEqual(lines[0], "【编号】CVE-2026-1111")
-        self.assertEqual(lines[1], "【标题】标题 1")
-        self.assertEqual(lines[2], "【摘要】摘要")
+        self.assertEqual(lines[1], "【标题原文】标题 1")
+        self.assertEqual(lines[2], "【摘要原文】摘要")
         self.assertEqual(lines[3], "【链接】https://e.test/1")
 
     def test_cve_prefix_stripped_from_title(self):
         item = make_item(1, title="CVE-2026-118636: Apache MINA: Unsafe Deserialization",
                          cves=("CVE-2026-118636",))
-        self.assertIn("【标题】Apache MINA: Unsafe Deserialization", render_item(item, markup=False))
+        self.assertIn("【标题原文】Apache MINA: Unsafe Deserialization", render_item(item, markup=False))
 
     def test_title_that_is_only_a_cve_is_kept(self):
         item = make_item(1, title="CVE-2026-1111", cves=("CVE-2026-1111",))
-        self.assertIn("【标题】CVE-2026-1111", render_item(item, markup=False))
+        self.assertIn("【标题原文】CVE-2026-1111", render_item(item, markup=False))
 
     def test_multiple_cves_on_one_line(self):
         item = make_item(1, cves=("CVE-2026-40001", "CVE-2026-40002"))
@@ -54,13 +54,13 @@ class TestRenderItem(unittest.TestCase):
     def test_missing_cve_omits_line(self):
         text = render_item(make_item(1, cves=()), markup=False)
         self.assertNotIn("【编号】", text)
-        self.assertTrue(text.startswith("【标题】"))
+        self.assertTrue(text.startswith("【标题原文】"))
 
     def test_missing_summary_and_link(self):
         item = make_item(1, summary="", cves=("CVE-2026-1111",))
         item.link = ""
         self.assertEqual(render_item(item, markup=False).splitlines(),
-                         ["【编号】CVE-2026-1111", "【标题】标题 1"])
+                         ["【编号】CVE-2026-1111", "【标题原文】标题 1"])
 
     def test_severity_line(self):
         item = make_item(1, cves=("CVE-2026-1111",), severity=4)
@@ -79,26 +79,37 @@ class TestRenderItem(unittest.TestCase):
         lines = render_item(item, markup=False).splitlines()
         self.assertEqual(lines[2], "【标记】已知勒索团伙利用")
 
-    def test_translated_title_and_original(self):
+    def test_translated_title_and_summary_keep_both_lines(self):
         item = make_item(1, title="Ivanti Connect Secure Authentication Bypass",
                          summary="English summary", cves=("CVE-2026-1111",))
         item.title_zh = "Ivanti Connect Secure 身份认证绕过"
         item.summary_zh = "这是一段中文摘要"
         lines = render_item(item, markup=False).splitlines()
-        self.assertEqual(lines[1], "【标题】Ivanti Connect Secure 身份认证绕过")
-        self.assertEqual(lines[2], "【原文】Ivanti Connect Secure Authentication Bypass")
-        self.assertIn("【摘要】这是一段中文摘要", lines)
-        self.assertNotIn("English summary", "\n".join(lines))
+        self.assertEqual(lines[1], "【标题翻译】Ivanti Connect Secure 身份认证绕过")
+        self.assertEqual(lines[2], "【标题原文】Ivanti Connect Secure Authentication Bypass")
+        self.assertIn("【摘要翻译】这是一段中文摘要", lines)
+        self.assertIn("【摘要原文】English summary", lines)
+
+    def test_no_translation_shows_only_original(self):
+        """没译文时不能出现「翻译」标签——标签必须和内容对得上。"""
+        text = render_item(make_item(1, summary="English summary"), markup=False)
+        self.assertNotIn("【标题翻译】", text)
+        self.assertNotIn("【摘要翻译】", text)
+        self.assertIn("【标题原文】", text)
+        self.assertIn("【摘要原文】", text)
 
     def test_translated_title_keeps_cve_prefix_out(self):
         item = make_item(1, title="CVE-2026-1111: Foo", cves=("CVE-2026-1111",))
         item.title_zh = "CVE-2026-1111: 中文标题"
-        self.assertIn("【标题】中文标题", render_item(item, markup=False))
+        self.assertIn("【标题翻译】中文标题", render_item(item, markup=False))
 
-    def test_same_translation_has_no_original_line(self):
+    def test_identical_translation_is_not_repeated(self):
+        """译文和原文一样（中文源）时只留一行，别出现两行一模一样的内容。"""
         item = make_item(1, title="Same title")
         item.title_zh = "Same title"
-        self.assertNotIn("【原文】", render_item(item, markup=False))
+        text = render_item(item, markup=False)
+        self.assertNotIn("【标题翻译】", text)
+        self.assertEqual(text.count("Same title"), 1)
 
     def test_also_line(self):
         merged = make_item(1)
@@ -110,7 +121,7 @@ class TestMarkup(unittest.TestCase):
     def test_title_is_bold(self):
         # 不加空格：与【编号】【摘要】【链接】一致，也让 --dry-run 和线上卡片对齐
         text = render_item(make_item(1, title="标题一"))
-        self.assertIn("【标题】**标题一**", text)
+        self.assertIn("【标题原文】**标题一**", text)
 
     def test_high_severity_is_red(self):
         item = make_item(1, severity=4, cvss=9.8)

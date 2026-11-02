@@ -96,7 +96,8 @@ def shorten_bytes(text: str, budget: int) -> str:
 def render_item(item: Item, *, markup: bool = True) -> str:
     """一条漏洞渲染成字段化的多行文本。字段没有值就整行省略，不留空壳。
 
-    有译文时【标题】用中文，并把英文原标题放进【原文】，方便核对和搜索。
+    标题和摘要都拆成「翻译 / 原文」两行：有译文时两行都给（译文在上、原文在下），
+    没译文时只给原文那一行。标签必须和内容对得上——不能把英文挂在「翻译」下面。
     """
     title = item.title
     if item.cves:
@@ -109,21 +110,19 @@ def render_item(item: Item, *, markup: bool = True) -> str:
         stripped = CVE_TITLE_PREFIX.sub("", title_zh).strip()
         if stripped:
             title_zh = stripped
-    display = title_zh or title
+    # 译文和原文一样（中文源、或 Google 原样返回）时不算翻译，否则会出现两行一模一样
+    translated_title = bool(title_zh) and title_zh != title
 
     lines = []
     if item.cves:
         lines.append("【编号】" + "、".join(item.cves))
 
-    if markup:
-        # 不加空格：其它字段（【编号】【摘要】【链接】）都是紧贴内容，
-        # 【标题】多一个空格会让 --dry-run 的排版和线上卡片对不上
-        lines.append("【标题】**" + escape_md(display) + "**")
+    # 加粗只给"主行"：有译文时是译文，没译文时是原文
+    if translated_title:
+        lines.append("【标题翻译】" + (f"**{escape_md(title_zh)}**" if markup else title_zh))
+        lines.append("【标题原文】" + (escape_md(title) if markup else title))
     else:
-        lines.append("【标题】" + display)
-
-    if title_zh and title_zh != title:
-        lines.append("【原文】" + (escape_md(title) if markup else title))
+        lines.append("【标题原文】" + (f"**{escape_md(title)}**" if markup else title))
 
     if item.severity >= 1:
         label = SEVERITY_LABELS.get(item.severity, "")
@@ -141,10 +140,11 @@ def render_item(item: Item, *, markup: bool = True) -> str:
             value = f"<font color='red'>{value}</font>"
         lines.append("【标记】" + value)
 
-    summary = item.summary_zh.strip() or item.summary
-    if summary:
-        summary = escape_md(summary) if markup else summary
-        lines.append("【摘要】" + summary)
+    summary_zh = item.summary_zh.strip()
+    if summary_zh and summary_zh != item.summary:
+        lines.append("【摘要翻译】" + (escape_md(summary_zh) if markup else summary_zh))
+    if item.summary:
+        lines.append("【摘要原文】" + (escape_md(item.summary) if markup else item.summary))
 
     if item.link:
         # 链接也来自外部源：不处理的话，一个带 <font> / ** 的 URL 就能往卡片里注入样式。

@@ -335,10 +335,12 @@ def sample_page() -> Page:
         "Vigil · 测试消息",
         "webhook、签名与卡片渲染正常",
         "【编号】CVE-2026-00000\n"
-        "【标题】 **这是一条样式测试消息**\n"
+        "【标题翻译】**这是一条样式测试消息**\n"
+        "【标题原文】This is a style test message\n"
         "【等级】<font color='red'>严重（CVSS 9.8）</font>\n"
         "【标记】<font color='red'>已知勒索团伙利用</font>\n"
-        "【摘要】收到这张卡片，说明推送链路整条都是通的；正式消息的排版与这里一致。\n"
+        "【摘要翻译】收到这张卡片，说明推送链路整条都是通的；正式消息的排版与这里一致。\n"
+        "【摘要原文】If you can read this, the whole delivery chain works.\n"
         "【链接】https://open.feishu.cn/",
     )
 

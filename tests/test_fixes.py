@@ -616,8 +616,8 @@ class TestTitleSpacing(unittest.TestCase):
     def test_markup_and_plain_agree(self):
         """两种模式排版必须一致，否则 --dry-run 看到的样子和线上卡片对不上。"""
         item = make_item(title="同一个标题")
-        self.assertIn("【标题】**同一个标题**", render_item(item, markup=True))
-        self.assertIn("【标题】同一个标题", render_item(item, markup=False))
+        self.assertIn("【标题原文】**同一个标题**", render_item(item, markup=True))
+        self.assertIn("【标题原文】同一个标题", render_item(item, markup=False))
 
 
 class TestWebhookFallback(unittest.TestCase):

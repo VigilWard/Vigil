@@ -280,11 +280,12 @@ TEMPLATE = """<!doctype html>
   <table>
     <tr><th>字段</th><th>何时出现</th><th>样式</th></tr>
     <tr><td>【编号】</td><td>有条目带 CVE 时</td><td>多个用「、」连接，纯文本</td></tr>
-    <tr><td>【标题】</td><td>总是</td><td>加粗；开头重复的 CVE 号会被剥掉</td></tr>
-    <tr><td>【原文】</td><td>有译文且与原文不同</td><td>纯文本</td></tr>
+    <tr><td>【标题翻译】</td><td>有译文且与原文不同</td><td>加粗；开头重复的 CVE 号会被剥掉</td></tr>
+    <tr><td>【标题原文】</td><td>总是</td><td>没有译文时由它加粗，充当主标题</td></tr>
     <tr><td>【等级】</td><td>源里能读到等级时</td><td>严重/高危红、低灰、中不着色，有分数时附 CVSS</td></tr>
     <tr><td>【标记】</td><td>仅 KEV 的勒索条目</td><td>红色「已知勒索团伙利用」</td></tr>
-    <tr><td>【摘要】</td><td>有摘要时</td><td>最多 300 字，超出以 … 结尾</td></tr>
+    <tr><td>【摘要翻译】</td><td>有译文且与原文不同</td><td>最多 300 字，超出以 … 结尾</td></tr>
+    <tr><td>【摘要原文】</td><td>有摘要时</td><td>最多 300 字，超出以 … 结尾</td></tr>
     <tr><td>【链接】</td><td>有链接时</td><td>最多 600 字</td></tr>
     <tr><td>【另见】</td><td>跨源合并时</td><td>同一 CVE 还被哪些源报了</td></tr>
   </table>

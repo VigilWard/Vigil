@@ -33,8 +33,17 @@ jobs:
       FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
       FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
       FEISHU_WEBHOOKS: ${{ secrets.FEISHU_WEBHOOKS }}
-      # 设成 0 可以彻底关掉翻译（内容就不会发往 Google）
+      # 设成 0 可以彻底关掉翻译（内容就不会发往第三方）
       TRANSLATE: ${{ vars.TRANSLATE || '1' }}
+      # 百度通用翻译（可选）：配了就会排在第一位，比免费源稳、中文质量更好。
+      # 放在 Secrets 里，不要写进任何会提交的文件。
+      BAIDU_APPID: ${{ secrets.BAIDU_APPID }}
+      BAIDU_KEY: ${{ secrets.BAIDU_KEY }}
+      # 给 MyMemory 的 de 参数：匿名配额 5 千字符/天 → 带邮箱 5 万字符/天。
+      # 想换邮箱就加一个仓库变量 TRANSLATE_EMAIL，会覆盖这里的默认值。
+      TRANSLATE_EMAIL: ${{ vars.TRANSLATE_EMAIL || 'vigilis@163.com' }}
+      # 可选：换 Google 的镜像或代理时用
+      TRANSLATE_ENDPOINT: ${{ vars.TRANSLATE_ENDPOINT }}
     steps:
       - uses: actions/checkout@v4
 
@@ -85,7 +94,7 @@ jobs:
           case "${{ inputs.mode || 'run' }}" in
             test)  python watch.py --test ;;
             reset) python watch.py --reset ;;
-            probe) python tools/check_google.py ;;
+            probe) python tools/check_translate.py ;;
             *)     python watch.py ;;
           esac
 

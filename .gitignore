@@ -4,3 +4,5 @@ __pycache__/
 state.json
 state.json.tmp
 config.local.json
+preview/
+.workbuddy-ai/

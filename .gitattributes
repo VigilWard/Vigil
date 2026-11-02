@@ -1,0 +1,4 @@
+# 统一用 LF：仓库里已经是 LF，但 Windows 上的编辑器和 Python 的
+# Path.write_text() 默认会写成 CRLF，那样一次提交就会变成"整篇重写"。
+# 这里显式钉死，git 会在提交时自动归一化。
+* text=auto eol=lf

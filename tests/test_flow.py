@@ -327,9 +327,10 @@ class TestTranslation(FlowCase):
         self.assertEqual(self.run_main(), 0)
 
         message = self.posts[-1]
-        self.assertIn("中文：New advisory", message)
-        self.assertIn("【原文】New advisory", message)
-        self.assertIn("中文摘要", message)
+        self.assertIn("【标题翻译】**中文：New advisory**", message)
+        self.assertIn("【标题原文】New advisory", message)
+        self.assertIn("【摘要翻译】中文摘要", message)
+        self.assertIn("【摘要原文】desc", message)
 
     def test_translation_does_not_break_dedup(self):
         self.run_main()
