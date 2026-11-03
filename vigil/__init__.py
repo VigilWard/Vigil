@@ -8,7 +8,7 @@
     net.py        HTTP：重试、条件请求、字节上限、安全重定向、编码嗅探
     parse.py      文本清洗 + RSS/KEV/JSON/nginx 解析器
     state.py      基线、内容指纹、待送达队列、原子写
-    render.py     消息渲染与字节分页
+    render.py     消息渲染（一条公告一条消息）
     feishu.py     飞书签名、卡片封装与推送
     collect.py    抓取编排与跨源合并
     translate.py  标题/摘要英译中（Google / 百度 / MyMemory 自动降级，可选）

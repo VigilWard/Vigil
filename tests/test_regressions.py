@@ -48,7 +48,7 @@ from vigil.models import (
 )
 from vigil.net import Response
 from vigil.parse import clean, cvss_of, parse_json, parse_nginx, parse_rss, parse_time, severity_of
-from vigil.render import compose, paginate, render_item, sanitize_link
+from vigil.render import compose, render_item, sanitize_link
 from vigil.state import STATE_VERSION, State, load_state
 from vigil.translate import Provider, Translator
 
@@ -295,28 +295,22 @@ class TestSeenCap(unittest.TestCase):
         self.assertEqual(dropped, 5)
 
 
-class TestPaginateCounting(unittest.TestCase):
-    def test_header_block_is_not_counted_as_item(self):
-        """分组标题溢出时不能算成"另有 1 条"。"""
-        blocks = [("x" * 200, ["k1"]), ("【在野利用】", []), ("源B（1条）", [])]
-        pages, overflow = paginate(blocks, budget=300, max_pages=1)
-        self.assertEqual(len(pages), 1)
-        self.assertEqual(overflow, 0)
-
-    def test_item_blocks_are_counted(self):
-        blocks = [("x" * 200, ["k1"]), ("y" * 200, ["k2"]), ("z" * 200, ["k3"])]
-        pages, overflow = paginate(blocks, budget=300, max_pages=1)
-        self.assertEqual(len(pages), 1)
-        self.assertEqual(overflow, 2)
-        self.assertEqual(pages[0][1], ["k1"])
-
-    def test_zero_pages_counts_items_only(self):
-        pages, overflow = paginate([("x", ["1"]), ("【标题】", [])], budget=500, max_pages=0)
-        self.assertEqual(pages, [])
-        self.assertEqual(overflow, 1)
+class TestOverflowCounting(unittest.TestCase):
+    def test_overflow_counts_real_items_only(self):
+        """顺延条数必须等于"没发出去的条目数"，不能把标题之类的块算进去。"""
+        config = Config(sources=[Source("源A", "https://a.test/1", limit=10)], max_items=10)
+        source = config.sources[0]
+        items = [Item(source_key=source.key, source_name=source.name, uid=f"u{i}",
+                      title=f"标题 {i}", link="", published=100 - i, summary="")
+                 for i in range(5)]
+        messages = compose(config, items, NOW, max_messages=2)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("另有 3 条顺延到下一轮", messages[-1].subtitle)
+        acked = {key for message in messages for key in message.keys}
+        self.assertEqual(len(acked) + 3, len(items))
 
 
-class TestPageTemplate(unittest.TestCase):
+class TestMessageTemplate(unittest.TestCase):
     def setUp(self):
         self.config = Config(sources=[Source("源A", "https://a.test/1")], max_items=50)
 
@@ -331,17 +325,17 @@ class TestPageTemplate(unittest.TestCase):
                               published=1000 - index, summary="描述" * 60))
         return items
 
-    def test_template_follows_each_page(self):
-        pages = compose(self.config, self._items(20), 1793000000, budget=900)
-        self.assertGreater(len(pages), 1)
-        self.assertEqual(pages[0].template, "red")
-        for page in pages[1:]:
-            self.assertEqual(page.template, "blue")
+    def test_each_message_uses_its_own_template(self):
+        """一条公告一条消息：红色只属于在野利用那条，不会把整批都染红。"""
+        messages = compose(self.config, self._items(20), NOW)
+        self.assertEqual(messages[0].template, "red")
+        for message in messages[1:]:
+            self.assertEqual(message.template, "blue")
 
 
 class TestEscapedPayloadSize(unittest.TestCase):
     def test_heavy_escaping_still_fits_feishu_limit(self):
-        """实体转义会让正文膨胀几倍，必须确认满页请求体仍在 20KB 以内。"""
+        """实体转义会让正文膨胀几倍，必须确认单条消息的请求体仍在 20KB 以内。"""
         config = Config(sources=[Source("A", "https://a.test/1")], max_items=50)
         source = config.sources[0]
         items = [Item(source_key=source.key, source_name=source.name, uid=f"u{i}",
@@ -381,14 +375,16 @@ class TestFingerprint(unittest.TestCase):
         self.assertFalse(state.is_fresh(make_item(summary="v2")))
 
 
-class TestSourceNameEscaping(unittest.TestCase):
-    def test_source_name_with_markdown_chars_is_escaped(self):
+class TestSourceNameInSubtitle(unittest.TestCase):
+    def test_source_name_with_markdown_chars_is_kept_verbatim(self):
+        """副标题是 plain_text，不做 markdown 转义；转成实体反而会显示成 &#42;。"""
         config = Config(sources=[Source("A*B", "https://a.test/1")])
         source = config.sources[0]
         item = Item(source_key=source.key, source_name=source.name, uid="u1",
                     title="标题", link="", published=1, summary="")
-        body = compose(config, [item], 1793000000)[0].body
-        self.assertIn("A&#42;B（1条）", body)
+        message = compose(config, [item], 1793000000)[0]
+        self.assertIn("A*B", message.subtitle)
+        self.assertNotIn("&#42;", message.subtitle)
 
 
 class TestStateVersion(unittest.TestCase):
@@ -722,21 +718,22 @@ class TestSplitText(unittest.TestCase):
         self.assertEqual("".join(chunks), "A" * 5000)
 
 
-class TestPaginateKeyless(unittest.TestCase):
-    def test_keyless_page_is_not_dropped(self):
-        """只有"源异常提示"这类没有条目 key 的块时，内容也不能被静默丢掉。"""
-        pages, overflow = paginate([("⚠ 抓取失败：坏源\n", [])], budget=500, max_pages=3)
-        self.assertEqual(len(pages), 1)
-        self.assertEqual(pages[0][1], [])
-        self.assertEqual(overflow, 0)
+class TestStatusOnlyMessage(unittest.TestCase):
+    def test_status_only_message_is_not_dropped(self):
+        """只有"源异常提示"、没有条目时，提示也不能被静默丢掉。"""
+        config = Config(sources=[Source("源A", "https://a.test/1")])
+        messages = compose(config, [], NOW, failures=[Failure("坏源", "k", "HTTP 500")])
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].keys, [])
+        self.assertIn("抓取失败：坏源", messages[0].body)
 
     def test_failure_notice_rides_with_items(self):
         config = Config(sources=[Source("源A", "https://a.test/1")])
         items = [Item(source_key=config.sources[0].key, source_name="源A", uid="u1",
                       title="标题", link="", published=1, summary="")]
-        pages = compose(config, items, 1793000000, failures=[Failure("坏源", "k", "HTTP 500")])
-        self.assertIn("抓取失败：坏源", pages[0].body)
-        self.assertEqual(len(pages[0].keys), 1)
+        messages = compose(config, items, 1793000000, failures=[Failure("坏源", "k", "HTTP 500")])
+        self.assertIn("抓取失败：坏源", messages[0].body)
+        self.assertEqual(len(messages[0].keys), 1)
 
 
 class TestSourceKeyNormalization(unittest.TestCase):
@@ -1227,16 +1224,18 @@ class TestAlertChunking(unittest.TestCase):
         self.assertLessEqual(len(chunks[0][0][1].encode("utf-8")), 100)
 
 
-class TestPaginationNoOrphanHeader(unittest.TestCase):
-    def test_every_page_has_an_item(self):
+class TestOneMessagePerItem(unittest.TestCase):
+    def test_every_message_carries_exactly_one_item(self):
+        """一条公告一条消息：再多的条目也不会被塞进同一张卡片。"""
         config = Config([Source("源A", "https://a.test/1")], max_items=10)
         items = [Item(source_key=config.sources[0].key, source_name="源A", uid=f"u{i}",
                       title=f"标题 {i}", link="", published=1000 - i, summary="描述")
                  for i in range(10)]
-        pages = compose(config, items, NOW, budget=200)
-        self.assertGreater(len(pages), 1)
-        for page in pages:
-            self.assertTrue(page.keys, page.body)
+        messages = compose(config, items, NOW)
+        self.assertEqual(len(messages), 10)
+        for message in messages:
+            self.assertEqual(len(message.keys), 1)
+            self.assertTrue(message.body)
 
 
 class TestRedirectSsrf(unittest.TestCase):

@@ -1,4 +1,9 @@
-"""把条目渲染成飞书消息体，并按字节预算分页。
+"""把条目渲染成飞书消息：一条公告一条消息。
+
+为什么不把多条塞进一张卡片：
+  一张卡片里按「源 → 等级」分组，普通漏洞会把高危漏洞夹在中间，扫消息时
+  很难一眼挑出来。拆成一条一条之后，每张卡片自己的头部配色、图标和副标题
+  都在说"这条有多要紧"，等级再也不会被邻居淹没。
 
 同一份内容有两种输出：
   markup=True   → 卡片用的 lark_md（加粗标题、等级着色）
@@ -15,7 +20,7 @@ from .models import (
     MAX_CARD_BODY_BYTES,
     MAX_ITEMS,
     MAX_LINK_CHARS,
-    MAX_PAGES,
+    MAX_MESSAGES,
     MAX_SUMMARY_CHARS,
     MAX_TITLE_CHARS,
     Config,
@@ -27,6 +32,12 @@ from .models import (
 
 CVE_TITLE_PREFIX = re.compile(r"^(?:CVE-\d{4}-\d{4,8}[\s:：]+)+", re.I)
 SEVERITY_LABELS = {1: "低", 2: "中", 3: "高", 4: "严重"}
+# 卡片头部只能放纯文本，颜色又不能只靠模板色区分（蓝底同时覆盖中/低/未知），
+# 所以标题前面再加一个字符标记，扫消息列表时不用点开也能看出等级。
+SEVERITY_ICONS = {1: "⚪", 2: "🟡", 3: "🟠", 4: "🔴"}
+EXPLOITED_ICON = "🚨"
+# 卡片头部标题只用来"认消息"，不承载全文；正文里的【标题原文】才是完整版。
+HEADER_TITLE_CHARS = 60
 
 # 飞书的 lark_md 不支持反斜杠转义，官方要求把命中的特殊字符换成 HTML 实体，
 # 否则标题里的 * 会把后面的文字吃掉。& 必须一起换，避免二次解析。
@@ -52,8 +63,8 @@ _MD_ESCAPE_RE = re.compile("[" + re.escape("".join(_MD_ESCAPES)) + "]")
 
 
 @dataclass(slots=True)
-class Page:
-    """一页消息。标题、副标题进卡片头部，正文进卡片 body。"""
+class Message:
+    """一条飞书消息。标题、副标题进卡片头部，正文进卡片 body。"""
 
     title: str
     subtitle: str
@@ -113,17 +124,23 @@ def _inline(text: str) -> str:
     return " ".join((text or "").split())
 
 
+def _display_title(item: Item) -> str:
+    """标题去掉开头重复的 CVE 号——编号已经单独占一行，标题里再写一遍只是噪音。"""
+    title = shorten(_inline(item.title), MAX_TITLE_CHARS)
+    if item.cves:
+        stripped = CVE_TITLE_PREFIX.sub("", title).strip()
+        if stripped:
+            title = stripped
+    return title
+
+
 def render_item(item: Item, *, markup: bool = True) -> str:
     """一条漏洞渲染成字段化的多行文本。字段没有值就整行省略，不留空壳。
 
     标题和摘要都拆成「翻译 / 原文」两行：有译文时两行都给（译文在上、原文在下），
     没译文时只给原文那一行。标签必须和内容对得上——不能把英文挂在「翻译」下面。
     """
-    title = shorten(_inline(item.title), MAX_TITLE_CHARS)
-    if item.cves:
-        stripped = CVE_TITLE_PREFIX.sub("", title).strip()
-        if stripped:
-            title = stripped
+    title = _display_title(item)
 
     title_zh = shorten(_inline(item.title_zh), MAX_TITLE_CHARS)
     if title_zh and item.cves:
@@ -155,8 +172,15 @@ def render_item(item: Item, *, markup: bool = True) -> str:
             label = f"<font color='grey'>{label}</font>"
         lines.append("【等级】" + label)
 
+    # 「在野利用」以前只体现在分组标题【在野利用】里；拆成一条一条之后
+    # 分组标题没了，这个信号必须落到每一条自己的正文里，否则会丢信息。
+    marks = []
+    if item.exploited:
+        marks.append("已确认在野利用")
     if item.ransomware:
-        value = "已知勒索团伙利用"
+        marks.append("已知勒索团伙利用")
+    if marks:
+        value = "、".join(marks)
         if markup:
             value = f"<font color='red'>{value}</font>"
         lines.append("【标记】" + value)
@@ -181,105 +205,75 @@ def render_item(item: Item, *, markup: bool = True) -> str:
     return "\n".join(lines)
 
 
-def build_sections(config: Config, items: list[Item]):
-    """按「在野利用 / 新披露」→ 源 → 严重度、时间 分组。"""
-    order = {source.key: index for index, source in enumerate(config.sources)}
-    sources = {source.key: source for source in config.sources}
+def select_items(config: Config, items: list[Item]) -> tuple[list[Item], int]:
+    """按每个源的 limit 挑出本轮要发的条目，返回 (入选条目, 顺延条数)。
 
-    buckets: dict[tuple[bool, str], list[Item]] = {}
-    for item in items:
-        buckets.setdefault((item.exploited, item.source_key), []).append(item)
-
-    sections = []
-    for exploited, label in ((True, "在野利用"), (False, "新披露")):
-        groups = []
-        keys = sorted({key[1] for key in buckets if key[0] == exploited},
-                      key=lambda key: order.get(key, 999))
-        for skey in keys:
-            values = sorted(
-                buckets[(exploited, skey)],
-                key=lambda item: (-item.severity, -item.published, item.title),
-            )
-            source = sources.get(skey)
-            # 至少展示 1 条：limit 为 0/负数只可能来自直接构造的 Source，
-            # 真按它切片会让这一组永远显示"另有 N 条"却一条都发不出去。
-            limit = max(1, (source.limit or config.max_items) if source else MAX_ITEMS)
-            shown = values[:limit]
-            # 源被从 config 里删掉时（条目还在队列里）用条目自带的源名兜底。
-            name = source.name if source else values[0].source_name
-            groups.append((name, shown, len(values) - len(shown)))
-        if groups:
-            sections.append((label, groups))
-    return sections
-
-
-def paginate(blocks: list[tuple[str, list[str]]], budget: int, max_pages: int):
-    """把消息块塞进不超过 budget 字节的若干页。
-
-    返回 ([(正文, keys)], overflow)。超出的块不会被确认送达，下一轮会重发。
-    overflow 只统计**条目**，分组标题这类没有 keys 的块不计入，
-    否则消息里会写「另有 N 条」而用户根本找不到那 N 条。
+    limit 是"每轮最多发几条"的洪泛闸门：同一源内先按 (等级, 时间) 排好再截断，
+    留下的必须是最要紧的那几条，而不是恰好排在前面那几条。被截断的条目不会
+    被确认送达，下一轮会重新进入候选，所以只会延后、不会丢。
     """
-    if max_pages < 1:
-        return [], sum(len(keys) for _, keys in blocks)
+    sources = {source.key: source for source in config.sources}
+    buckets: dict[str, list[Item]] = {}
+    for item in items:
+        buckets.setdefault(item.source_key, []).append(item)
 
-    pages: list[tuple[str, list[str]]] = []
-    current = ""
-    keys: list[str] = []
-    overflow = 0
-
-    for text, block_keys in blocks:
-        text = text.replace("\r", "")
-        if not text:
-            continue
-        while True:
-            if not current:
-                # 页首不留空行
-                text = text.lstrip("\n")
-                if not text:
-                    break
-            sep = 1 if current else 0
-            room = budget - len(current.encode("utf-8", "replace")) - sep
-            if len(text.encode("utf-8", "replace")) <= room:
-                current = f"{current}\n{text}" if current else text
-                keys.extend(block_keys)
-                break
-            if current:
-                if len(pages) + 1 >= max_pages:
-                    # 最后一页也装不下了：剩下的条目留给下一轮，只数条目
-                    overflow += len(block_keys)
-                    break
-                pages.append((current, keys))
-                current, keys = "", []
-                continue
-            # 整页只放一个块还放不下：截断后仍然发出，避免死循环
-            piece = shorten_bytes(text, max(0, room))
-            if not piece:
-                overflow += len(block_keys)
-                break
-            log("⚠ 单条内容超过单页预算，已截断")
-            current = piece
-            keys.extend(block_keys)
-            break
-
-    if current and len(pages) < max_pages:
-        # 用 current 而不是 keys 判空：只有"源异常提示"这类没有条目 key 的块
-        # 时也要成页，否则整页内容会被静默丢掉
-        pages.append((current, keys))
-    return pages, overflow
+    selected: list[Item] = []
+    deferred = 0
+    for source_key, values in buckets.items():
+        values.sort(key=lambda item: (-item.severity, -item.published, item.title))
+        source = sources.get(source_key)
+        # 至少展示 1 条：limit 为 0/负数只可能来自直接构造的 Source，
+        # 真按它切片会让这个源永远发不出去。
+        limit = max(1, (source.limit or config.max_items) if source else MAX_ITEMS)
+        selected.extend(values[:limit])
+        deferred += max(0, len(values) - limit)
+    return selected, deferred
 
 
-def card_template(items: list[Item]) -> str:
-    """卡片头部配色。
+def _rank(item: Item) -> tuple:
+    """越要紧越靠前：在野利用 → 等级 → 时间 → 标题。
+
+    先发重要的不只是"看起来舒服"：真撞上飞书限流或时间预算耗尽时，
+    被截掉的是排在后面的普通条目，而不是最需要处理的那条。
+    """
+    return (not item.exploited, -item.severity, -item.published, item.title)
+
+
+def _header_title(item: Item) -> str:
+    title = shorten(_display_title(item), HEADER_TITLE_CHARS) or "（无标题）"
+    icon = EXPLOITED_ICON if item.exploited else SEVERITY_ICONS.get(item.severity, "")
+    return f"{icon} {title}" if icon else title
+
+
+def _subtitle(item: Item, stamp: str, index: int, total: int, overflow: int) -> str:
+    parts = [item.source_name, stamp]
+    marks = []
+    if item.exploited:
+        marks.append("在野利用")
+    if item.severity >= 1:
+        label = SEVERITY_LABELS.get(item.severity, "")
+        if item.cvss:
+            label = f"{label}（CVSS {item.cvss:.1f}）"
+        marks.append(label)
+    if marks:
+        parts.append(" · ".join(marks))
+    if total > 1:
+        parts.append(f"第 {index}/{total} 条")
+    if overflow:
+        parts.append(f"另有 {overflow} 条顺延到下一轮")
+    return " · ".join(part for part in parts if part)
+
+
+def card_template(item: Item) -> str:
+    """单条消息的头部配色。
 
     red 只留给"确认在野利用"，普通严重用 carmine，避免每条都刺眼。
     """
-    if any(item.exploited for item in items):
+    if item.exploited:
         return "red"
-    top = max((item.severity for item in items), default=0)
-    if top >= 4:
+    if item.severity >= 4:
         return "carmine"
-    if top == 3:
+    if item.severity == 3:
         return "orange"
     return "blue"
 
@@ -293,66 +287,54 @@ def compose(
     skipped: list[Failure] | None = None,
     markup: bool = True,
     budget: int = MAX_CARD_BODY_BYTES,
-) -> list[Page]:
+    max_messages: int = MAX_MESSAGES,
+) -> list[Message]:
+    """把条目渲染成一条条消息，一条公告一条。
+
+    返回的每一条都带着自己的 keys（含被跨源合并掉的条目），调用方逐条发送、
+    逐条确认；没发出去的自然留在队列里，下一轮补发。
+    """
     failures = failures or []
     skipped = skipped or []
 
-    blocks: list[tuple[str, list[str]]] = []
+    notes = []
     for failure in failures:
         name = escape_md(failure.name) if markup else failure.name
-        blocks.append((f"⚠ 抓取失败：{name}\n", []))
+        notes.append(f"⚠ 抓取失败：{name}")
     for failure in skipped:
         name = escape_md(failure.name) if markup else failure.name
-        blocks.append((f"⚠ 本轮未检查：{name}\n", []))
+        notes.append(f"⚠ 本轮未检查：{name}")
 
-    for label, groups in build_sections(config, items):
-        section = f"【{label}】"
-        first_group = True
-        for name, values, hidden in groups:
-            # 源名来自配置，和条目一样要转义，否则名字里的 * 会把整行吃掉
-            shown_name = escape_md(name) if markup else name
-            header = f"{shown_name}（{len(values) + hidden}条）"
-            if first_group:
-                # 分组标题、源标题和第一条绑成一个块：分页时不会出现
-                # "上一页只剩标题、条目全在下一页"的孤儿标题。
-                header = f"{section}\n{header}"
-                first_group = False
-            # build_sections 保证每组至少 1 条，这里不需要空组兜底。
-            first = values[0]
-            blocks.append((
-                header + "\n" + render_item(first, markup=markup) + "\n",
-                [first.key],
-            ))
-            for item in values[1:]:
-                # 条目自带结尾空行：块与块之间自然隔开，源标题紧跟第一个条目
-                blocks.append((render_item(item, markup=markup) + "\n", [item.key]))
-            if hidden > 0:
-                blocks.append((f"…另有{hidden}条未列出，将顺延到后续轮次\n", []))
+    selected, deferred = select_items(config, items)
+    selected.sort(key=_rank)
+    # 一次刷几十条既会撞飞书限流（5 次/秒），也会把群刷屏；
+    # 超出上限的留在队列里，下一轮优先发（排序保证先发要紧的）。
+    overflow = deferred + max(0, len(selected) - max_messages)
+    selected = selected[:max_messages]
 
-    title = f"Vigil · {datetime.fromtimestamp(now, CST):%m-%d %H:%M}"
-    exploited = sum(1 for item in items if item.exploited)
-    # 没有条目、只有源异常提示时不能说"0 条待送达"，那会让人以为消息是空的
-    subtitle = f"{len(items)} 条待送达" if items else "源状态提示"
-    if exploited:
-        subtitle += f" · 含 {exploited} 条在野利用"
+    stamp = f"{datetime.fromtimestamp(now, CST):%m-%d %H:%M}"
+    if not selected:
+        if not notes:
+            return []
+        # 只有源异常、没有条目时也发一条状态消息，别把提示吞掉
+        return [Message("Vigil · 源状态提示", stamp, "\n".join(notes))]
 
-    by_key = {item.key: item for item in items}
-    # 合并条目：分页时只按"看得见的条目"计数，确认送达时再把被合并的 key 一起带上。
-    # 否则 overflow 会把一个条目的两个 key 算成两条，副标题里的"另有 N 条"会虚高。
-    merged_by_key = {item.key: item.merged for item in items if item.merged}
-    raw_pages, overflow = paginate(blocks, budget, MAX_PAGES)
-    total = len(raw_pages)
-    pages = []
-    for index, (body, keys) in enumerate(raw_pages, 1):
-        page_subtitle = subtitle
-        if total > 1:
-            page_subtitle += f" · 第 {index}/{total} 页"
-        if overflow and index == total:
-            page_subtitle += f" · 另有 {overflow} 条顺延到下一轮"
-        page_items = [by_key[key] for key in keys if key in by_key]
-        ack_keys = list(keys)
-        for key in keys:
-            ack_keys.extend(merged_by_key.get(key, ()))
-        pages.append(Page(title, page_subtitle, body.rstrip("\n"), ack_keys,
-                          card_template(page_items)))
-    return pages
+    total = len(selected)
+    messages: list[Message] = []
+    for index, item in enumerate(selected, 1):
+        body = render_item(item, markup=markup)
+        if index == 1 and notes:
+            # 源异常提示搭第一条的车：不额外占一条消息，也不会因为后面某条
+            # 推送失败而丢掉（第一条失败时整轮都不会确认，下一轮会重发）
+            body = "\n".join(notes) + "\n\n" + body
+        if len(body.encode("utf-8", "replace")) > budget:
+            log("⚠ 单条公告超过消息预算，已截断")
+            body = shorten_bytes(body, budget)
+        messages.append(Message(
+            _header_title(item),
+            _subtitle(item, stamp, index, total, overflow if index == total else 0),
+            body.rstrip("\n"),
+            [item.key, *item.merged],
+            card_template(item),
+        ))
+    return messages

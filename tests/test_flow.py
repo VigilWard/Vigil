@@ -377,22 +377,44 @@ class TestPendingLifecycle(FlowCase):
         self.assertEqual(len(self.posts), 1)
 
 
-class TestPagination(FlowCase):
-    def test_multiple_pages_are_sent_and_acked_per_page(self):
-        """端到端验证：分页后每一页都真的发出去、并只确认自己那一页。"""
+class TestOneMessagePerItem(FlowCase):
+    def test_each_item_gets_its_own_message(self):
+        """一条公告一条消息：3 条新条目就是 3 条消息，不再挤在一张卡片里。"""
         self.run_main()
-        self.feed = build_rss([
-            (f"n{i}", f"公告 {i} " + "标题" * 30, "描述" * 80) for i in range(12)
-        ])
-        with mock.patch("vigil.app.MAX_CARD_BODY_BYTES", 900):
+        self.feed = build_rss([(f"g{i}", f"公告 {i}", f"描述 {i}") for i in range(3)])
+        self.assertEqual(self.run_main(), 0)
+
+        self.assertEqual(len(self.posts), 3)
+        for index, post in enumerate(self.posts):
+            self.assertIn(f"公告 {index}", post)
+        # 每条消息只带自己那一条，不会把邻居也塞进来
+        self.assertNotIn("公告 0", self.posts[1])
+        self.assertNotIn("公告 2", self.posts[1])
+
+    def test_message_cap_keeps_the_rest_pending(self):
+        """超出单轮上限的条目不能凭空消失：必须留在队列里，下一轮补发。"""
+        self.run_main()
+        self.feed = build_rss([(f"g{i}", f"公告 {i}", "描述") for i in range(5)])
+        with mock.patch("vigil.app.MAX_MESSAGES", 2):
             self.assertEqual(self.run_main(), 0)
 
-        self.assertGreater(len(self.posts), 1, "预算这么小，应该分成多页")
+        self.assertEqual(len(self.posts), 2)
+        self.assertEqual(len(self.state()["pending"]), 3)
+
+        # 下一轮把剩下的补完
+        self.assertEqual(self.run_main(), 0)
+        self.assertEqual(self.state()["pending"], {})
+        self.assertEqual(len(self.posts), 5)
+
+    def test_sent_items_are_acked_per_message(self):
+        """逐条确认：每条消息送达后，它自己那一批 key 立刻转正。"""
+        self.run_main()
+        self.feed = build_rss([("n0", "公告 0", "描述"), ("n1", "公告 1", "描述")])
+        self.assertEqual(self.run_main(), 0)
+
         state = self.state()
-        self.assertGreater(len(state["seen"]), 1)
-        self.assertGreater(len(state["pending"]), 0)
-        # 基线 1 条 + 新条目 12 条：要么已送达，要么还在队列，不能凭空消失
-        self.assertEqual(len(state["seen"]) + len(state["pending"]), 13)
+        self.assertEqual(state["pending"], {})
+        self.assertEqual(len(state["seen"]), 3)      # 基线 1 条 + 新条目 2 条
 
 
 if __name__ == "__main__":

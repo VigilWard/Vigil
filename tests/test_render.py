@@ -1,14 +1,13 @@
-"""消息渲染、字节分页与跨源合并。"""
+"""消息渲染：一条公告一条消息、等级排序与顺延。"""
 import unittest
 
 from vigil.collect import merge
 from vigil.models import MAX_CARD_BODY_BYTES, Config, Failure, Item, Source
 from vigil.render import (
-    build_sections,
     card_template,
     compose,
-    paginate,
     render_item,
+    select_items,
 )
 
 
@@ -79,6 +78,16 @@ class TestRenderItem(unittest.TestCase):
         lines = render_item(item, markup=False).splitlines()
         self.assertEqual(lines[2], "【标记】已知勒索团伙利用")
 
+    def test_exploited_mark_is_in_the_body(self):
+        """分组标题【在野利用】没有了，这个信号必须落在每条自己的正文里。"""
+        item = make_item(1, exploited=True)
+        self.assertIn("【标记】已确认在野利用", render_item(item, markup=False))
+
+    def test_exploited_and_ransomware_share_one_line(self):
+        item = make_item(1, exploited=True)
+        item.ransomware = True
+        self.assertIn("【标记】已确认在野利用、已知勒索团伙利用", render_item(item, markup=False))
+
     def test_translated_title_and_summary_keep_both_lines(self):
         item = make_item(1, title="Ivanti Connect Secure Authentication Bypass",
                          summary="English summary", cves=("CVE-2026-1111",))
@@ -148,6 +157,10 @@ class TestMarkup(unittest.TestCase):
         item.ransomware = True
         self.assertIn("<font color='red'>已知勒索团伙利用</font>", render_item(item))
 
+    def test_exploited_is_red(self):
+        self.assertIn("<font color='red'>已确认在野利用</font>",
+                      render_item(make_item(1, exploited=True)))
+
     def test_dynamic_text_is_escaped(self):
         # 飞书 lark_md 不支持反斜杠转义，必须换成 HTML 实体
         item = make_item(1, title="a * b * c", summary="x_y [z]")
@@ -169,7 +182,7 @@ class TestMarkup(unittest.TestCase):
         self.assertNotIn("**", text)
 
 
-class TestSections(unittest.TestCase):
+class TestSelectItems(unittest.TestCase):
     def setUp(self):
         self.config = Config(sources=[
             Source("源A", "https://a.test/1"),
@@ -177,121 +190,117 @@ class TestSections(unittest.TestCase):
         ], max_items=2)
         self.a, self.b = self.config.sources
 
-    def test_split_exploited_first(self):
-        items = [make_item(1, source_key=self.a.key),
-                 make_item(2, source_key=self.a.key, exploited=True)]
-        labels = [section[0] for section in build_sections(self.config, items)]
-        self.assertEqual(labels, ["在野利用", "新披露"])
+    def test_per_source_limit(self):
+        selected, deferred = select_items(self.config, items_for(self.config, 5))
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(deferred, 3)
 
-    def test_severity_before_time(self):
-        config = Config(sources=[Source("源A", "https://a.test/1")])
+    def test_limit_keeps_the_most_severe_not_the_first(self):
+        """limit 截断前必须先按等级排序，否则高危条目会被排在前面的普通条目挤掉。"""
+        config = Config(sources=[Source("源A", "https://a.test/1", limit=1)], max_items=5)
         key = config.sources[0].key
         low = make_item(1, source_key=key, severity=1, published=900)
         critical = make_item(2, source_key=key, severity=4, published=100)
-        groups = build_sections(config, [low, critical])[0][1]
-        self.assertEqual([i.uid for i in groups[0][1]], ["u2", "u1"])
+        selected, deferred = select_items(config, [low, critical])
+        self.assertEqual([item.uid for item in selected], ["u2"])
+        self.assertEqual(deferred, 1)
 
-    def test_hidden_count(self):
-        groups = build_sections(self.config, items_for(self.config, 5))[0][1]
-        self.assertEqual(len(groups[0][1]), 2)
-        self.assertEqual(groups[0][2], 3)
+    def test_source_removed_from_config_uses_global_limit(self):
+        orphan = make_item(9, source_key="gone", source_name="已删除的源")
+        selected, deferred = select_items(self.config, [orphan])
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(deferred, 0)
 
-    def test_per_source_limit_overrides_global(self):
-        config = Config(sources=[Source("源A", "https://a.test/1", limit=1)], max_items=5)
-        groups = build_sections(config, items_for(config, 3))[0][1]
-        self.assertEqual(len(groups[0][1]), 1)
-
-    def test_sources_keep_config_order(self):
+    def test_each_source_is_capped_independently(self):
         items = items_for(self.config, 3) + [
             make_item(9, source_key=self.b.key, source_name=self.b.name)
         ]
-        groups = build_sections(self.config, items)[0][1]
-        self.assertEqual([group[0] for group in groups], ["源A", "源B"])
-
-
-class TestPaginate(unittest.TestCase):
-    def test_single_page(self):
-        pages, overflow = paginate([("x", ["1"])], budget=1000, max_pages=3)
-        self.assertEqual(len(pages), 1)
-        self.assertEqual(pages[0], ("x", ["1"]))
-        self.assertEqual(overflow, 0)
-
-    def test_budget_is_respected(self):
-        blocks = [("条目" * 40, [str(i)]) for i in range(30)]
-        pages, overflow = paginate(blocks, budget=600, max_pages=3)
-        self.assertEqual(len(pages), 3)
-        self.assertGreater(overflow, 0)
-        for body, _ in pages:
-            self.assertLessEqual(len(body.encode("utf-8")), 600)
-
-    def test_overflow_blocks_are_not_acknowledged(self):
-        blocks = [("x" * 400, [str(i)]) for i in range(10)]
-        pages, overflow = paginate(blocks, budget=1000, max_pages=2)
-        acked = [key for _, keys in pages for key in keys]
-        self.assertEqual(len(acked) + overflow, 10)
-        self.assertEqual(len(set(acked)), len(acked))
-
-    def test_oversized_block_is_truncated_not_dropped(self):
-        pages, overflow = paginate([("x" * 5000, ["k"])], budget=500, max_pages=1)
-        self.assertEqual(overflow, 0)
-        self.assertEqual(pages[0][1], ["k"])
-        self.assertLessEqual(len(pages[0][0].encode("utf-8")), 500)
-
-    def test_zero_pages(self):
-        pages, overflow = paginate([("x", ["1"])], budget=500, max_pages=0)
-        self.assertEqual(pages, [])
-        self.assertEqual(overflow, 1)
+        selected, deferred = select_items(self.config, items)
+        self.assertEqual(len(selected), 3)      # 源A 2 条 + 源B 1 条
+        self.assertEqual(deferred, 1)
 
 
 class TestCompose(unittest.TestCase):
     def setUp(self):
         self.config = Config(sources=[Source("源A", "https://a.test/1")], max_items=50)
 
-    def test_all_pages_within_budget(self):
+    def test_one_message_per_item(self):
+        messages = compose(self.config, items_for(self.config, 3), 1793000000)
+        self.assertEqual(len(messages), 3)
+        for message in messages:
+            self.assertEqual(len(message.keys), 1)
+
+    def test_most_urgent_comes_first(self):
+        source = self.config.sources[0]
+        items = [
+            make_item(1, source_key=source.key, severity=1, published=900),
+            make_item(2, source_key=source.key, severity=2, published=800),
+            make_item(3, source_key=source.key, severity=3, published=700),
+            make_item(4, source_key=source.key, exploited=True, severity=1, published=100),
+        ]
+        messages = compose(self.config, items, 1793000000)
+        self.assertIn("u4", messages[0].keys[0])
+        self.assertIn("u3", messages[1].keys[0])
+        self.assertIn("u2", messages[2].keys[0])
+        self.assertIn("u1", messages[3].keys[0])
+
+    def test_header_shows_severity_icon_and_source(self):
+        item = make_item(1, severity=4, cvss=9.8, cves=("CVE-2026-1111",))
+        message = compose(self.config, [item], 1793000000)[0]
+        self.assertTrue(message.title.startswith("🔴 "))
+        self.assertIn("源A", message.subtitle)
+        self.assertIn("严重（CVSS 9.8）", message.subtitle)
+        self.assertEqual(message.template, "carmine")
+        self.assertIn("【编号】CVE-2026-1111", message.body)
+
+    def test_exploited_uses_alarm_icon_and_red(self):
+        item = make_item(1, exploited=True, severity=4)
+        message = compose(self.config, [item], 1793000000)[0]
+        self.assertTrue(message.title.startswith("🚨 "))
+        self.assertIn("在野利用", message.subtitle)
+        self.assertEqual(message.template, "red")
+        self.assertIn("已确认在野利用", message.body)
+
+    def test_message_index_in_subtitle(self):
+        messages = compose(self.config, items_for(self.config, 3), 1793000000)
+        for index, message in enumerate(messages, 1):
+            self.assertIn(f"第 {index}/3 条", message.subtitle)
+
+    def test_max_messages_limits_and_reports_overflow(self):
+        messages = compose(self.config, items_for(self.config, 5), 1793000000, max_messages=3)
+        self.assertEqual(len(messages), 3)
+        self.assertIn("另有 2 条顺延到下一轮", messages[-1].subtitle)
+        for message in messages[:-1]:
+            self.assertNotIn("顺延", message.subtitle)
+
+    def test_per_source_limit_counts_as_overflow(self):
+        config = Config(sources=[Source("源A", "https://a.test/1", limit=2)], max_items=10)
+        messages = compose(config, items_for(config, 5), 1793000000)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("另有 3 条顺延到下一轮", messages[-1].subtitle)
+
+    def test_body_stays_within_budget(self):
         items = items_for(self.config, 60, summary="很长的中文描述" * 20)
-        pages = compose(self.config, items, 1793000000, budget=MAX_CARD_BODY_BYTES)
-        self.assertTrue(pages)
-        for page in pages:
-            self.assertLessEqual(len(page.body.encode("utf-8")), MAX_CARD_BODY_BYTES)
+        messages = compose(self.config, items, 1793000000, budget=MAX_CARD_BODY_BYTES)
+        self.assertTrue(messages)
+        for message in messages:
+            self.assertLessEqual(len(message.body.encode("utf-8")), MAX_CARD_BODY_BYTES)
 
-    def test_header_and_body_split(self):
-        items = items_for(self.config, 1, cves=("CVE-2026-1111",))
-        pages = compose(self.config, items, 1793000000)
-        page = pages[0]
-        self.assertTrue(page.title.startswith("Vigil · "))
-        self.assertIn("1 条待送达", page.subtitle)
-        self.assertIn("【编号】", page.body)
-        self.assertNotIn("Vigil", page.body)
+    def test_notes_ride_with_the_first_message(self):
+        messages = compose(self.config, items_for(self.config, 2), 1793000000,
+                           failures=[Failure("坏源", "k", "x")],
+                           skipped=[Failure("慢源", "k2", "y")])
+        self.assertIn("抓取失败：坏源", messages[0].body)
+        self.assertIn("未检查：慢源", messages[0].body)
+        self.assertNotIn("抓取失败", messages[1].body)
 
-    def test_page_numbers_in_subtitle(self):
-        items = items_for(self.config, 60, summary="很长的中文描述" * 20)
-        pages = compose(self.config, items, 1793000000, budget=MAX_CARD_BODY_BYTES)
-        self.assertGreater(len(pages), 1)
-        for index, page in enumerate(pages, 1):
-            self.assertIn(f"第 {index}/{len(pages)} 页", page.subtitle)
-
-    def test_exploited_count_in_subtitle(self):
-        config = Config(sources=[Source("源A", "https://a.test/1")])
-        items = [make_item(1, source_key=config.sources[0].key, exploited=True),
-                 make_item(2, source_key=config.sources[0].key)]
-        pages = compose(config, items, 1793000000)
-        self.assertIn("含 1 条在野利用", pages[0].subtitle)
-
-    def test_notes_appear_in_body(self):
-        pages = compose(self.config, items_for(self.config, 1), 1793000000,
-                        failures=[Failure("坏源", "k", "x")],
-                        skipped=[Failure("慢源", "k2", "y")])
-        self.assertIn("抓取失败：坏源", pages[0].body)
-        self.assertIn("未检查：慢源", pages[0].body)
-
-    def test_hidden_hint(self):
-        config = Config(sources=[Source("源A", "https://a.test/1")], max_items=2)
-        pages = compose(config, items_for(config, 5), 1793000000)
-        self.assertIn("另有3条未列出", pages[0].body)
-
-    def test_keys_cover_all_items_on_page(self):
-        pages = compose(self.config, items_for(self.config, 2), 1793000000)
-        self.assertEqual(len(pages[0].keys), 2)
+    def test_status_only_message_when_no_items(self):
+        messages = compose(self.config, [], 1793000000,
+                           failures=[Failure("坏源", "k", "x")])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("源状态提示", messages[0].title)
+        self.assertIn("抓取失败：坏源", messages[0].body)
+        self.assertEqual(messages[0].keys, [])
 
     def test_empty_items(self):
         self.assertEqual(compose(self.config, [], 1793000000), [])
@@ -301,57 +310,30 @@ class TestCompose(unittest.TestCase):
         self.assertIn("<font", compose(self.config, items, 1793000000)[0].body)
         self.assertNotIn("<font", compose(self.config, items, 1793000000, markup=False)[0].body)
 
-    def test_as_text_matches_plain_layout(self):
-        text = compose(self.config, items_for(self.config, 1), 1793000000, markup=False)[0].as_text()
-        self.assertTrue(text.startswith("Vigil · "))
-        self.assertIn("\n【新披露】", text)
-
-    def test_merged_keys_do_not_inflate_overflow(self):
-        """被合并的 key 跟着上页用于确认，但不能算进"另有 N 条"。"""
-        config = Config(sources=[Source("A", "https://a.test/1"),
-                                 Source("B", "https://b.test/2")], max_items=50)
-        source_a, source_b = config.sources
-
-        def pair(number):
-            return [
-                Item(source_key=source_a.key, source_name="A", uid=f"a{number}",
-                     title=f"公告 {number} " + "标题" * 20,
-                     link=f"https://e.test/{number}", published=100 - number,
-                     summary="描述" * 60, cves=(f"CVE-2026-{number}",)),
-                Item(source_key=source_b.key, source_name="B", uid=f"b{number}",
-                     title=f"公告 {number} " + "标题" * 20,
-                     link=f"https://e.test/b{number}", published=100 - number,
-                     summary="描述" * 60, cves=(f"CVE-2026-{number}",)),
-            ]
-
-        raw = [item for number in range(1, 11) for item in pair(number)]
-        items = merge(raw, config)
-        self.assertEqual(len(items), 10)
-        visible = {item.key for item in items}
-        for budget in range(300, 3000, 50):
-            pages = compose(config, items, 1793000000, budget=budget)
-            subtitle = pages[-1].subtitle
-            overflow = int(subtitle.split("另有 ")[1].split(" 条")[0]) if "另有 " in subtitle else 0
-            if overflow:
-                acked = {key for page in pages for key in page.keys if key in visible}
-                self.assertEqual(overflow, len(items) - len(acked))
-                return
-        self.fail("没有找到能触发溢出的预算")
+    def test_as_text_contains_title_and_body(self):
+        item = make_item(1, title="标题一", severity=4)
+        text = compose(self.config, [item], 1793000000, markup=False)[0].as_text()
+        self.assertTrue(text.startswith("🔴 标题一 · "))
+        self.assertIn("\n【标题原文】标题一", text)
 
 
 class TestCardTemplate(unittest.TestCase):
     def test_exploited_is_red(self):
-        self.assertEqual(card_template([make_item(1, exploited=True)]), "red")
+        self.assertEqual(card_template(make_item(1, exploited=True)), "red")
+
+    def test_exploited_wins_over_severity(self):
+        # 在野利用比"严重"更需要立刻处理，哪怕这条自身只标了低危
+        self.assertEqual(card_template(make_item(1, exploited=True, severity=1)), "red")
 
     def test_critical_is_carmine(self):
         # red 只留给确认在野利用，普通严重用 carmine
-        self.assertEqual(card_template([make_item(1, severity=4)]), "carmine")
+        self.assertEqual(card_template(make_item(1, severity=4)), "carmine")
 
     def test_high_is_orange(self):
-        self.assertEqual(card_template([make_item(1, severity=3)]), "orange")
+        self.assertEqual(card_template(make_item(1, severity=3)), "orange")
 
     def test_default_is_blue(self):
-        self.assertEqual(card_template([make_item(1)]), "blue")
+        self.assertEqual(card_template(make_item(1)), "blue")
 
 
 class TestMerge(unittest.TestCase):
@@ -391,13 +373,13 @@ class TestMerge(unittest.TestCase):
         kev = self._item(self.kev, "k1", "CVE-2026-1111", exploited=True, published=1)
         self.assertEqual(merge([oss, kev], self.config)[0].uid, "k1")
 
-    def test_loser_key_rides_into_the_page(self):
-        """被合并掉的条目虽然不渲染，但它的 key 必须跟着上页，否则永远不会被 ack。"""
+    def test_loser_key_rides_into_the_message(self):
+        """被合并掉的条目虽然不渲染，但它的 key 必须跟着上消息，否则永远不会被 ack。"""
         kev = self._item(self.kev, "k1", "CVE-2026-1111", exploited=True)
         oss = self._item(self.oss, "o1", "CVE-2026-1111")
-        page = compose(self.config, merge([oss, kev], self.config), 1793000000)[0]
-        self.assertIn(kev.key, page.keys)
-        self.assertIn(oss.key, page.keys)
+        message = compose(self.config, merge([oss, kev], self.config), 1793000000)[0]
+        self.assertIn(kev.key, message.keys)
+        self.assertIn(oss.key, message.keys)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@
     python tools/preview_cards.py            # 写到 preview/cards.html
     python tools/preview_cards.py out.html
 
-内容全部走 vigil 的真实代码路径（render.compose / feishu.card_of / app.sample_page），
+内容全部走 vigil 的真实代码路径（render.compose / feishu.card_of / app.sample_message），
 所以预览里看到什么，飞书里就是什么。颜色值取自飞书客户端的近似值。
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from vigil.app import build_alerts, sample_page  # noqa: E402
+from vigil.app import build_alerts, sample_message  # noqa: E402
 from vigil.feishu import card_of  # noqa: E402
 from vigil.models import (  # noqa: E402
     CST,
@@ -66,15 +66,15 @@ def lark_to_html(text: str) -> str:
     return text
 
 
-def render_card(page, note: str, code: str) -> str:
-    card = card_of(page, page.template)
+def render_card(message, note: str, code: str) -> str:
+    card = card_of(message, message.template)
     head = card["header"]
     title = html_mod.escape(head["title"]["content"])
     subtitle = html_mod.escape(head.get("subtitle", {}).get("content", ""))
     body = "\n".join(
         element["text"]["content"] for element in card["elements"] if element.get("text")
     )
-    color = HEAD_COLORS.get(page.template, HEAD_COLORS["blue"])
+    color = HEAD_COLORS.get(message.template, HEAD_COLORS["blue"])
     sub_html = f'<div class="card-sub">{subtitle}</div>' if subtitle else ""
     body_html = lark_to_html(body) if body else ""
     return f"""
@@ -182,7 +182,7 @@ def build_demo():
 
 
 def build_multipage(config: Config):
-    """单独造一个"条目多到要分页"的源，limit 放大会展示 50 条、隐藏 10 条。"""
+    """单独造一个"条目多到超出单轮上限"的源，用来看顺延提示。"""
     source = Source("批量源", "https://example.test/bulk", limit=50)
     bulk_config = Config([source], max_items=50)
     items = []
@@ -192,7 +192,7 @@ def build_multipage(config: Config):
             title=f"第 {index + 1} 条批量公告：某组件存在内存越界",
             link=f"https://example.test/advisory/{index}",
             published=NOW - index * 60,
-            summary="这段摘要故意写得很长，用来把卡片撑到三页。" * 12,
+            summary="这段摘要故意写得很长，用来演示每条消息都带完整字段。" * 12,
             cves=(f"CVE-2026-{20000 + index}",), severity=(index % 5),
         ))
     return bulk_config, items
@@ -256,16 +256,16 @@ TEMPLATE = """<!doctype html>
     只是把 lark_md 渲染成了等价 HTML。颜色为飞书客户端模板色的近似值。
   </p>
 
-  <h2>一、四种头部配色</h2>
-  <p class="h2sub">由本轮最严重的内容决定：在野利用 → 红，严重 → 胭脂红，高危 → 橙，其余 → 蓝。</p>
+  <h2>一、一条公告一条消息</h2>
+  <p class="h2sub">每张卡片只放一条公告，按自己的等级取色：在野利用 → 红，严重 → 胭脂红，高危 → 橙，其余 → 蓝。</p>
   {cards}
 
-  <h2>二、分页与顺延</h2>
-  <p class="h2sub">单页正文上限 14000 字节，单轮最多 3 页；放不下的条目留在队列，下一轮继续。</p>
+  <h2>二、消息条数与顺延</h2>
+  <p class="h2sub">单轮单目标最多 30 条；放不下的条目留在队列，下一轮优先补发。</p>
   {multipage}
 
   <h2>三、源异常提示</h2>
-  <p class="h2sub">抓取失败、被时间预算跳过的源会写在卡片最上面，不占条目的位置。</p>
+  <p class="h2sub">抓取失败、被时间预算跳过的源会写在第一条消息的正文最上面，不额外占一条消息。</p>
   {failures}
 
   <h2>四、纯文本状态告警</h2>
@@ -283,7 +283,7 @@ TEMPLATE = """<!doctype html>
     <tr><td>【标题翻译】</td><td>有译文且与原文不同</td><td>加粗；开头重复的 CVE 号会被剥掉</td></tr>
     <tr><td>【标题原文】</td><td>总是</td><td>没有译文时由它加粗，充当主标题</td></tr>
     <tr><td>【等级】</td><td>源里能读到等级时</td><td>严重/高危红、低灰、中不着色，有分数时附 CVSS</td></tr>
-    <tr><td>【标记】</td><td>仅 KEV 的勒索条目</td><td>红色「已知勒索团伙利用」</td></tr>
+    <tr><td>【标记】</td><td>在野利用 / 勒索条目</td><td>红色「已确认在野利用」「已知勒索团伙利用」</td></tr>
     <tr><td>【摘要翻译】</td><td>有译文且与原文不同</td><td>最多 300 字，超出以 … 结尾</td></tr>
     <tr><td>【摘要原文】</td><td>有摘要时</td><td>最多 300 字，超出以 … 结尾</td></tr>
     <tr><td>【链接】</td><td>有链接时</td><td>最多 600 字</td></tr>
@@ -311,23 +311,31 @@ def main(argv: list[str] | None = None) -> int:
     cards = []
     cards.append(render_card(
         compose(config, [demo["exploited"]], NOW, budget=budget)[0],
-        "在野利用 + 勒索标记", 'card_template() == "red"'))
+        "在野利用 + 勒索标记（🚨 红底）", 'card_template() == "red"'))
     cards.append(render_card(
         compose(config, [demo["critical"]], NOW, budget=budget)[0],
         "严重漏洞，跨源合并（含【另见】）", 'card_template() == "carmine"'))
     cards.append(render_card(
         compose(config, [demo["high"]], NOW, budget=budget)[0],
-        "高危", 'card_template() == "orange"'))
+        "高危（🟠 橙底）", 'card_template() == "orange"'))
     cards.append(render_card(
-        compose(config, [demo["medium"], demo["low"], demo["plain"], demo["minimal"]],
-                NOW, budget=budget)[0],
-        "中 / 低 / 无等级 / 只有标题", 'card_template() == "blue"'))
+        compose(config, [demo["medium"]], NOW, budget=budget)[0],
+        "中危（🟡 蓝底）", 'card_template() == "blue"'))
+    cards.append(render_card(
+        compose(config, [demo["low"]], NOW, budget=budget)[0],
+        "低危（⚪ 灰色等级）", 'card_template() == "blue"'))
+    cards.append(render_card(
+        compose(config, [demo["plain"]], NOW, budget=budget)[0],
+        "没有等级：标题前不加图标", 'card_template() == "blue"'))
+    cards.append(render_card(
+        compose(config, [demo["minimal"]], NOW, budget=budget)[0],
+        "只有标题也能单独成一条", 'compose(...)[0]'))
 
     bulk_config, bulk = build_multipage(config)
-    bulk_pages = compose(bulk_config, bulk, NOW, budget=budget)
+    bulk_messages = compose(bulk_config, bulk, NOW, budget=budget)
     multipage = render_card(
-        bulk_pages[-1],
-        f"共 {len(bulk_pages)} 页，这里看最后一页（含顺延提示）",
+        bulk_messages[-1],
+        f"共 {len(bulk_messages)} 条消息，这里看最后一条（含顺延提示）",
         "compose(...)[-1]")
 
     failures = render_card(
@@ -347,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
     alerts_html = render_text_message("\n".join(a.text for a in alerts),
                                       "连续失败 + 已恢复，合并成一条")
 
-    testcard = render_card(sample_page(), "测试消息", "app.sample_page()")
+    testcard = render_card(sample_message(), "测试消息", "app.sample_message()")
 
     html = TEMPLATE.format(cards="".join(cards), multipage=multipage,
                            failures=failures, alerts=alerts_html, testcard=testcard)

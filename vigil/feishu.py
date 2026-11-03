@@ -23,7 +23,7 @@ from .models import (
     PushTarget,
     log,
 )
-from .render import Page
+from .render import Message
 
 # 飞书在限流时返回 HTTP 200 + 业务码：9499（通用）和 11232（自定义机器人最常遇到，
 # 单机器人 100 次/分钟、5 次/秒）。两者都属于可重试，不能当成永久错误。
@@ -58,21 +58,21 @@ def _payload(body: dict, target: PushTarget) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8", "replace")
 
 
-def card_of(page: Page, template: str) -> dict:
-    """把一页内容包成消息卡片。
+def card_of(message: Message, template: str) -> dict:
+    """把一条消息包成消息卡片。
 
-    颜色只出现在三处：头部模板色、等级、勒索标记——其余保持正文原样，
+    颜色只出现在三处：头部模板色、等级、勒索/在野利用标记——其余保持正文原样，
     避免给动态文本套样式带来的转义风险。
     """
     header: dict = {
         "template": template,
-        "title": {"tag": "plain_text", "content": page.title},
+        "title": {"tag": "plain_text", "content": message.title},
     }
-    if page.subtitle:
-        header["subtitle"] = {"tag": "plain_text", "content": page.subtitle}
+    if message.subtitle:
+        header["subtitle"] = {"tag": "plain_text", "content": message.subtitle}
     elements = []
-    if page.body:
-        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": page.body}})
+    if message.body:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": message.body}})
     return {"config": {"wide_screen_mode": True}, "header": header, "elements": elements}
 
 
@@ -153,7 +153,7 @@ def _send(body: dict, target: PushTarget, deadline: float | None) -> None:
         except BudgetExceeded:
             break
         if left is not None and delay > left:
-            # 等不起就别占着预算：这一页留在队列里，下一轮补发
+            # 等不起就别占着预算：这一条留在队列里，下一轮补发
             break
         log(f"   推送失败（{last_error}），{delay:.1f}s 后重试")
         time.sleep(delay)

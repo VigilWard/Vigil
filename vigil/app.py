@@ -19,6 +19,7 @@ from .models import (
     FAIL_ALERT,
     FETCH_BUDGET,
     MAX_CARD_BODY_BYTES,
+    MAX_MESSAGES,
     MAX_TEXT_BYTES,
     PUSH_INTERVAL,
     RUN_BUDGET,
@@ -32,7 +33,7 @@ from .models import (
     VigilError,
     log,
 )
-from .render import Page, compose, shorten_bytes
+from .render import Message, compose, shorten_bytes
 from .state import State, load_state
 
 
@@ -262,7 +263,7 @@ def _deliver(
     state_path: Path,
     deadline: float,
 ) -> bool:
-    """把待送达队列推给每个目标；每确认一页就立即落盘。"""
+    """把待送达队列推给每个目标；每确认一条就立即落盘。"""
     if not state.pending:
         # 没有待送达条目就不发卡片：源异常提示只在"本来就要发消息"时搭车，
         # 否则一个坏掉的源会让群里每 10 分钟收到一条空卡片。持续性故障由
@@ -278,24 +279,25 @@ def _deliver(
         items = merge(state.pending_for(target.tid), config)
         if not items:
             continue
-        pages = compose(
+        messages = compose(
             config, items, now,
             failures=report.failures,
             skipped=report.skipped,
             budget=MAX_CARD_BODY_BYTES,
+            max_messages=MAX_MESSAGES,
         )
-        for index, page in enumerate(pages, 1):
+        for index, message in enumerate(messages, 1):
             try:
-                send_card(card_of(page, page.template), target, deadline=deadline)
+                send_card(card_of(message, message.template), target, deadline=deadline)
             except PushError as exc:
-                log(f"⚠ 推送到 {target.tid} 失败：{exc}；未确认的页面会留在队列里")
+                log(f"⚠ 推送到 {target.tid} 失败：{exc}；未确认的消息会留在队列里")
                 ok = False
                 break
-            state.ack(page.keys, target.tid, target_ids, now)
+            state.ack(message.keys, target.tid, target_ids, now)
             state.save(state_path)
-            log(f"   目标 {target.tid} 第 {index}/{len(pages)} 页已确认送达")
-            if index < len(pages):
-                # 飞书自定义机器人限流 5 次/秒，多页连续发很容易撞上 11232
+            log(f"   目标 {target.tid} 第 {index}/{len(messages)} 条已确认送达")
+            if index < len(messages):
+                # 飞书自定义机器人限流 5 次/秒，连续发很容易撞上 11232
                 time.sleep(PUSH_INTERVAL)
     return ok
 
@@ -365,30 +367,32 @@ def cmd_dry_run(config: Config, state_path) -> int:
         log("dry-run：没有需要推送的新条目（已送达过的、或源没有变化）。")
         return 0
 
-    # 用和线上一致的卡片预算分页，否则这里显示的页数和实际发出去的对不上
-    pages = compose(config, items, now, failures=report.failures,
-                    skipped=report.skipped, markup=False, budget=MAX_CARD_BODY_BYTES)
-    for index, page in enumerate(pages, 1):
-        size = len(page.as_text().encode("utf-8", "replace"))
-        log(f"--- 第 {index}/{len(pages)} 页，{size} 字节（终端里不显示颜色和加粗） ---")
-        print(page.as_text())
-    log(f"dry-run：{len(items)} 条，{len(pages)} 页。未发送、未改动基线。")
+    # 用和线上一致的卡片预算与消息上限渲染，否则这里显示的条数和实际发出去的对不上
+    messages = compose(config, items, now, failures=report.failures,
+                       skipped=report.skipped, markup=False, budget=MAX_CARD_BODY_BYTES,
+                       max_messages=MAX_MESSAGES)
+    for index, message in enumerate(messages, 1):
+        size = len(message.as_text().encode("utf-8", "replace"))
+        log(f"--- 第 {index}/{len(messages)} 条，{size} 字节（终端里不显示颜色和加粗） ---")
+        print(message.as_text())
+    log(f"dry-run：{len(items)} 条，{len(messages)} 条消息。未发送、未改动基线。")
     return 0
 
 
-def sample_page() -> Page:
+def sample_message() -> Message:
     """--test 发的示例卡片；预览工具也复用它，保证演示和线上一致。"""
-    return Page(
-        "Vigil · 测试消息",
-        "webhook、签名与卡片渲染正常",
+    return Message(
+        "🔴 Vigil 测试消息",
+        "webhook、签名与卡片渲染正常 · 严重（CVSS 9.8） · 第 1/1 条",
         "【编号】CVE-2026-00000\n"
         "【标题翻译】**这是一条样式测试消息**\n"
         "【标题原文】This is a style test message\n"
         "【等级】<font color='red'>严重（CVSS 9.8）</font>\n"
-        "【标记】<font color='red'>已知勒索团伙利用</font>\n"
+        "【标记】<font color='red'>已确认在野利用、已知勒索团伙利用</font>\n"
         "【摘要翻译】收到这张卡片，说明推送链路整条都是通的；正式消息的排版与这里一致。\n"
         "【摘要原文】If you can read this, the whole delivery chain works.\n"
         "【链接】https://open.feishu.cn/",
+        template="carmine",
     )
 
 
@@ -398,8 +402,8 @@ def cmd_test() -> int:
         log("未配置 FEISHU_WEBHOOK / FEISHU_WEBHOOKS。")
         return 1
     # 发一张真实的卡片：既验证 webhook 和签名，也验证卡片渲染
-    page = sample_page()
-    card = card_of(page, page.template)
+    message = sample_message()
+    card = card_of(message, message.template)
     deadline = time.monotonic() + RUN_BUDGET
     failed = False
     for target in targets:

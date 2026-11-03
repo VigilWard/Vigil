@@ -6,7 +6,7 @@ from unittest import mock
 from tests.support import FakeResponse, http_error
 from vigil import feishu
 from vigil.models import MAX_CARD_BODY_BYTES, Config, Item, PushError, PushTarget, Source
-from vigil.render import Page, card_template, compose
+from vigil.render import Message, compose
 
 TARGET = PushTarget("https://open.feishu.cn/open-apis/bot/v2/hook/xxx", "my-secret")
 
@@ -114,18 +114,19 @@ class TestResponseHandling(unittest.TestCase):
 
 class TestCard(unittest.TestCase):
     def test_card_structure(self):
-        page = Page("Vigil · 10-31 21:50", "2 条待送达", "【编号】CVE-2026-1111")
-        card = feishu.card_of(page, "red")
+        message = Message("🔴 Ivanti 认证绕过", "CISA KEV · 11-01 21:50 · 严重（CVSS 9.8） · 第 1/1 条",
+                          "【编号】CVE-2026-1111")
+        card = feishu.card_of(message, "red")
 
         self.assertEqual(card["header"]["template"], "red")
-        self.assertEqual(card["header"]["title"]["content"], "Vigil · 10-31 21:50")
-        self.assertEqual(card["header"]["subtitle"]["content"], "2 条待送达")
+        self.assertEqual(card["header"]["title"]["content"], "🔴 Ivanti 认证绕过")
+        self.assertIn("CISA KEV", card["header"]["subtitle"]["content"])
         self.assertEqual(card["elements"][0]["tag"], "div")
         self.assertEqual(card["elements"][0]["text"]["tag"], "lark_md")
         self.assertIn("CVE-2026-1111", card["elements"][0]["text"]["content"])
 
     def test_card_without_body_has_no_elements(self):
-        card = feishu.card_of(Page("t", "", ""), "blue")
+        card = feishu.card_of(Message("t", "", ""), "blue")
         self.assertEqual(card["elements"], [])
         self.assertNotIn("subtitle", card["header"])
 
@@ -136,7 +137,7 @@ class TestCard(unittest.TestCase):
             captured["body"] = json.loads(request.data.decode("utf-8"))
             return FakeResponse(b'{"code":0}')
 
-        card = feishu.card_of(Page("t", "s", "b"), "orange")
+        card = feishu.card_of(Message("t", "s", "b"), "orange")
         with mock.patch("vigil.net.open_url", fake):
             feishu.send_card(card, TARGET)
 
@@ -145,8 +146,8 @@ class TestCard(unittest.TestCase):
         self.assertEqual(body["card"]["header"]["template"], "orange")
         self.assertEqual(body["sign"], feishu.sign("my-secret", body["timestamp"]))
 
-    def test_full_page_fits_request_limit(self):
-        """飞书自定义机器人请求体上限 20KB，满页卡片必须留出余量。"""
+    def test_single_message_fits_request_limit(self):
+        """飞书自定义机器人请求体上限 20KB；即使转义把正文撑大几倍也要留余量。"""
         config = Config(sources=[Source("源A", "https://a.test/1")], max_items=50)
         source = config.sources[0]
         items = [
@@ -156,11 +157,11 @@ class TestCard(unittest.TestCase):
                  cves=("CVE-2026-1111",), severity=4, cvss=9.8)
             for i in range(40)
         ]
-        pages = compose(config, items, 1793000000, budget=MAX_CARD_BODY_BYTES)
-        self.assertTrue(pages)
-        for page in pages:
+        messages = compose(config, items, 1793000000, budget=MAX_CARD_BODY_BYTES)
+        self.assertTrue(messages)
+        for message in messages:
             payload = feishu._payload(
-                {"msg_type": "interactive", "card": feishu.card_of(page, card_template(items))},
+                {"msg_type": "interactive", "card": feishu.card_of(message, message.template)},
                 TARGET,
             )
             self.assertLess(len(payload), 20000)

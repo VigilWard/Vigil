@@ -225,7 +225,7 @@ class State:
         return items
 
     def ack(self, keys: list[str], target_id: str, target_ids: set[str], now: int) -> None:
-        """确认一页送达：先按目标记账，所有目标都收到后才转正为 seen。"""
+        """确认一条消息送达：先按目标记账，所有目标都收到后才转正为 seen。"""
         if not target_ids:
             return
         completed: list[Item] = []
