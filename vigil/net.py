@@ -58,7 +58,11 @@ def _origin(url: str) -> tuple[str, str, int]:
         port = parts.port
     except ValueError as exc:  # 非法端口
         raise FetchError(f"地址端口非法：{url}") from exc
-    return scheme, (parts.hostname or "").lower(), port or (443 if scheme == "https" else 80)
+    # 端口 0 是 falsy：以前 `port or 443` 会把 https://host:0/ 当成 443，
+    # 真正的连接却打到 0，报错完全对不上。None 才是"没写端口"。
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, (parts.hostname or "").lower(), port
 
 
 def allow_private_hosts() -> bool:
@@ -117,9 +121,18 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         except FetchError as exc:
             raise urllib.error.HTTPError(newurl, code, str(exc), headers, fp) from exc
 
-        if new_origin[0] not in ("http", "https") or is_blocked_host(new_origin[1]):
+        if new_origin[0] not in ("http", "https") or not new_origin[1]:
             raise urllib.error.HTTPError(
-                newurl, code, "拒绝重定向到非 HTTP(S) 或非公网地址", headers, fp
+                newurl, code, "拒绝重定向到非 HTTP(S) 地址", headers, fp
+            )
+        # 跳到私网：只有"起点本来就在私网"且用户显式开了逃生门才放行。
+        # 公网源 → 私网一律拦（这才是 SSRF 面）；内网源 → 内网是正常运维
+        # （http→https、加尾斜杠、换 canonical 主机名），不该被一刀切打死。
+        if is_blocked_host(new_origin[1]) and not (
+            allow_private_hosts() and is_blocked_host(old_origin[1])
+        ):
+            raise urllib.error.HTTPError(
+                newurl, code, "拒绝重定向到本机或私网地址", headers, fp
             )
         if old_origin[0] == "https" and new_origin[0] != "https":
             raise urllib.error.HTTPError(newurl, code, "拒绝 HTTPS 降级重定向", headers, fp)
@@ -185,9 +198,11 @@ def decode_bytes(raw: bytes, declared: str | None = None) -> str:
       3. 没有可用声明时先试 UTF-8，再试中文/日文传统编码，最后 latin-1 兜底。
     """
     if raw.startswith(b"\xef\xbb\xbf"):
-        return raw.decode("utf-8-sig")
+        return raw.decode("utf-8-sig", "replace")
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return raw.decode("utf-16")
+        # BOM 之后是奇数个字节时，严格解码会抛 UnicodeDecodeError；它是 ValueError
+        # 的子类，会被 fetch 当成"请求不合法"且不重试。响应体坏了不该算配置错。
+        return raw.decode("utf-16", "replace")
 
     xml = re.match(rb"\s*<\?xml[^>]*encoding=[\"']([A-Za-z0-9._-]+)", raw[:200], re.I)
     xml_encoding = xml.group(1).decode("ascii", "ignore").lower() if xml else ""
@@ -293,6 +308,8 @@ def _inflate_limited(raw: bytes, deadline: float | None) -> bytes:
 
 def _decompress(raw: bytes, encoding: str, deadline: float | None) -> bytes:
     encoding = (encoding or "").lower().strip()
+    if encoding in ("", "identity"):
+        return raw
     if encoding == "gzip":
         try:
             with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
@@ -305,7 +322,10 @@ def _decompress(raw: bytes, encoding: str, deadline: float | None) -> bytes:
             return _inflate_limited(raw, deadline)
         except zlib.error as exc:
             raise DecodeError(f"deflate 解压失败：{exc}") from exc
-    return raw
+    # 不认识的值、以及 "gzip, deflate" 这类链式编码：以前直接 return raw，
+    # 压缩字节被当正文解码成乱码，再记成"源失败"，重试也不会好。
+    # 明确报错，日志里能一眼看出是编码不支持，而不是源站挂了。
+    raise FetchError(f"不支持的 Content-Encoding：{encoding}")
 
 
 def retry_after(headers) -> float | None:

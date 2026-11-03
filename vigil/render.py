@@ -87,19 +87,35 @@ def escape_md(text: str) -> str:
 # 刻意**不**转义 _ & ( ) # + $ !：它们在 URL 里合法且极常见
 # （security_advisories、?a=1&b=2），换成实体虽然显示一致，却会让链接没法点。
 _LINK_JUNK = re.compile(r"[<>\"'`|*~\[\]]")
-# 链接里如果出现 &#60; / &#42; 这类 HTML 实体，飞书 lark_md 会把它解码成
-# < / *，等于绕过了上面的字面剔除。只清掉"能还原成 markdown 控制符"的实体，
-# 保留 &amp; 和普通查询参数里的 &，避免把合法 URL 改坏。
-_HTML_ENTITY = re.compile(
-    r"&#(?:x[0-9a-f]+|\d+);"
-    r"|&(?:lt|gt|sim|ast|lowbar|lbrack|rbrack|num|plus|grave|dollar|excl|bsol);",
-    re.I,
-)
+# 链接里如果出现 &#60; / &NewLine; 这类实体，飞书 lark_md 会把它解码成
+# < / 换行，等于绕过了上面的字面剔除。只放行 &amp;，其余实体一律删掉。
+# 以前按名单删，漏了 &NewLine; 这类命名实体；而把 &#x26;（就是 &）也删掉，
+# 又会把合法的查询参数改坏——所以这里改成"白名单 + 全删"。
+_ENTITY_LIKE = re.compile(r"&#\d+;|&#[xX][0-9a-fA-F]+;|&[A-Za-z][A-Za-z0-9]*;")
+
+
+def _drop_entity(match: re.Match[str]) -> str:
+    """只放行"就是 &" 的实体，其余一律删掉。
+
+    &amp; / &#38; / &#x26; 都是 &，保下来才不会把 `?a=1&b=2` 改坏；
+    其它命名实体（&NewLine; 之类）和数字实体都可能被 lark_md 解码成标记或换行。
+    """
+    token = match.group(0)
+    lowered = token.lower()
+    if lowered == "&amp;":
+        return token
+    if lowered.startswith("&#"):
+        try:
+            code = int(lowered[3:-1], 16) if lowered[2] == "x" else int(lowered[2:-1])
+        except ValueError:
+            return ""
+        return "&amp;" if code == 38 else ""
+    return ""
 
 
 def sanitize_link(link: str) -> str:
     """把外部来源的链接压成"不可能构造标记"的形式。"""
-    return _HTML_ENTITY.sub("", _LINK_JUNK.sub("", link))
+    return _ENTITY_LIKE.sub(_drop_entity, _LINK_JUNK.sub("", link))
 
 
 def shorten_bytes(text: str, budget: int) -> str:
@@ -229,7 +245,9 @@ def select_items(config: Config, items: list[Item]) -> tuple[list[Item], int]:
     selected: list[Item] = []
     deferred = 0
     for source_key, values in buckets.items():
-        values.sort(key=lambda item: (-item.severity, -item.published, item.title))
+        # 稳定排序：等级、时间都相同时保持队列顺序（新条目按源里的先后入队），
+        # 不要再用标题做 tie-break——无日期的源（NGINX）会被按字母序挑走。
+        values.sort(key=lambda item: (-item.severity, -item.published))
         source = sources.get(source_key)
         # 至少展示 1 条：limit 为 0/负数只可能来自直接构造的 Source，
         # 真按它切片会让这个源永远发不出去。
@@ -240,12 +258,13 @@ def select_items(config: Config, items: list[Item]) -> tuple[list[Item], int]:
 
 
 def _rank(item: Item) -> tuple:
-    """越要紧越靠前：在野利用 → 等级 → 时间 → 标题。
+    """越要紧越靠前：在野利用 → 等级 → 时间。
 
     先发重要的不只是"看起来舒服"：真撞上飞书限流或时间预算耗尽时，
     被截掉的是排在后面的普通条目，而不是最需要处理的那条。
+    同分时保持 select_items 给出的队列顺序（稳定排序）。
     """
-    return (not item.exploited, -item.severity, -item.published, item.title)
+    return (not item.exploited, -item.severity, -item.published)
 
 
 def _header_title(item: Item) -> str:

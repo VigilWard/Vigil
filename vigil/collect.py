@@ -6,6 +6,8 @@ import time
 
 from .models import (
     EMPTY_ALERT,
+    FAIL_ALERT,
+    SKIP_ALERT,
     BudgetExceeded,
     Config,
     Failure,
@@ -22,6 +24,16 @@ from .state import State
 from .translate import build_translator
 
 HEALTH_REFRESH = 3600
+
+
+def _step(value: int, threshold: int) -> int:
+    """连续计数加到阈值就停。
+
+    只有"是否到阈值"有意义，继续累加会让 state 每轮都变（每 10 分钟一个
+    commit），告警文案也会变成"已连续 137 轮失败"。empty 一直是这么做的，
+    fail / skipped 以前漏了。
+    """
+    return min(value + 1, threshold)
 
 
 def _coarse(previous: int, now: int) -> int:
@@ -51,11 +63,9 @@ def collect(
         if time.monotonic() >= deadline:
             report.skipped.append(Failure(source.name, source.key, "整轮时间预算不足"))
             if not preview:
-                health.skipped += 1
+                health.skipped = _step(health.skipped, SKIP_ALERT)
             log(f"→ {source.name}（跳过：本轮时间预算不足）")
             continue
-        if not preview:
-            health.skipped = 0
 
         conditional = health.initialized
         try:
@@ -69,32 +79,41 @@ def collect(
         except NotModified:
             if not preview:
                 health.fail = 0
+                health.skipped = 0
                 health.last_ok = _coarse(health.last_ok, now)
                 # 304 表示"内容和上一轮一样"。如果上一轮就是空内容，
                 # 这一轮仍然是空内容，必须继续累计，否则支持 ETag 的源
                 # 永远到不了 EMPTY_ALERT 阈值。
-                if health.had_items and 0 < health.empty < EMPTY_ALERT:
+                if 0 < health.empty < EMPTY_ALERT:
                     health.empty += 1
             log(f"→ {source.name}（304 未变化）")
             continue
         except BudgetExceeded as exc:
             if not preview:
-                health.skipped += 1
+                health.skipped = _step(health.skipped, SKIP_ALERT)
             report.skipped.append(Failure(source.name, source.key, str(exc)))
             log(f"→ {source.name}（跳过：{exc}）")
             continue
         except (FetchError, OSError) as exc:
             if not preview:
-                health.fail += 1
+                health.fail = _step(health.fail, FAIL_ALERT)
+                # 真的去抓了（只是失败了），本轮不算"没检查"
+                health.skipped = 0
             report.failures.append(Failure(source.name, source.key, str(exc)))
             log(f"→ {source.name}\n⚠ 抓取失败：{exc}")
             continue
+
+        # 走到这里说明真的拿到了响应：后续无论是解析失败还是内容为空，
+        # 都算"检查过"了。清零放在这里而不是抓取之前，否则抓取中途
+        # 预算耗尽（BudgetExceeded）每轮都被先清零，skipped 永远到不了阈值。
+        if not preview:
+            health.skipped = 0
 
         try:
             parsed = PARSERS[source.kind](response.text, source)
         except ParseError as exc:
             if not preview:
-                health.fail += 1
+                health.fail = _step(health.fail, FAIL_ALERT)
             report.failures.append(Failure(source.name, source.key, str(exc)))
             log(f"→ {source.name}\n⚠ 解析失败：{exc}")
             continue
@@ -103,7 +122,7 @@ def collect(
             # 以前它会一路冒到 main，整轮直接挂掉、所有源都白抓；
             # 现在降级成"这个源失败"，其余源照常，连续 3 轮自然走告警。
             if not preview:
-                health.fail += 1
+                health.fail = _step(health.fail, FAIL_ALERT)
             report.failures.append(Failure(source.name, source.key, f"解析器异常：{exc!r}"))
             log(f"→ {source.name}\n⚠ 解析器异常：{exc!r}")
             continue
@@ -116,8 +135,12 @@ def collect(
             if parsed:
                 health.had_items = True
                 health.empty = 0
-            elif health.had_items:
-                # 以前有内容，现在合法但为空：可能是页面结构变了。
+            else:
+                # 两种情况都计数：
+                #   以前有内容 → 页面结构可能变了；
+                #   从来就没有内容 → 地址或解析规则可能不对。
+                # 以前只在 had_items 时计数，导致"一上来就是空"的新源
+                # 既建不了基线、也永远到不了告警阈值，静默死掉。
                 # 到阈值就停，避免 304 每轮把计数推到无穷大、每轮都改 state。
                 health.empty = min(health.empty + 1, EMPTY_ALERT)
         if not parsed:
@@ -132,8 +155,10 @@ def collect(
 
         if not health.initialized and not preview:
             if not parsed:
-                # 空的首次响应不建立基线：等真正有内容时再记，避免下一轮把整份历史当新条目推出去
-                log(f"→ {source.name}\n   首次接入但内容为空，暂不建立基线")
+                # 空的首次响应不建立基线：等真正有内容时再记，避免下一轮把整份历史当新条目推出去。
+                # empty 仍在累计，连续 3 轮就会走告警，不会静默死掉。
+                log(f"→ {source.name}\n   首次接入但内容为空，暂不建立基线"
+                    f"（已连续 {health.empty} 轮）")
                 continue
             for item in parsed:
                 state.remember(item, now)

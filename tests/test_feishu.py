@@ -89,34 +89,54 @@ class TestResponseHandling(unittest.TestCase):
         self.assertEqual(opener.call_count, 2)
 
     def test_non_json_response(self):
+        """200 + HTML 是代理/WAF 的错误页，等 1.2 秒再撞一次不会变好。"""
         body = FakeResponse(b"<html>502</html>")
-        with mock.patch("vigil.net.open_url", return_value=body), \
+        with mock.patch("vigil.net.open_url", return_value=body) as opener, \
                 self.assertRaises(PushError):
             feishu.send("hi", TARGET)
+        self.assertEqual(opener.call_count, 1)
+
+    def test_non_object_json_rejected(self):
+        body = FakeResponse(b"[]")
+        with mock.patch("vigil.net.open_url", return_value=body) as opener, \
+                self.assertRaises(PushError):
+            feishu.send("hi", TARGET)
+        self.assertEqual(opener.call_count, 1)
 
     def test_missing_code(self):
         body = FakeResponse(b'{"msg":"ok"}')
-        with mock.patch("vigil.net.open_url", return_value=body), \
+        with mock.patch("vigil.net.open_url", return_value=body) as opener, \
                 self.assertRaises(PushError):
             feishu.send("hi", TARGET)
+        self.assertEqual(opener.call_count, 1)
 
     def test_string_code_rejected(self):
         body = FakeResponse(b'{"code":"0"}')
-        with mock.patch("vigil.net.open_url", return_value=body), \
+        with mock.patch("vigil.net.open_url", return_value=body) as opener, \
                 self.assertRaises(PushError):
             feishu.send("hi", TARGET)
+        self.assertEqual(opener.call_count, 1)
 
     def test_status_code_field_supported(self):
         body = FakeResponse(b'{"StatusCode":0}')
-        with mock.patch("vigil.net.open_url", return_value=body):
+        with mock.patch("vigil.net.open_url", return_value=body) as opener:
             feishu.send("hi", TARGET)
+        self.assertEqual(opener.call_count, 1)
+
+    def test_legacy_status_message_is_reported(self):
+        """老格式用 StatusMessage；只读 msg 会让报错信息变成空的。"""
+        body = FakeResponse(b'{"StatusCode":19021,"StatusMessage":"sign match fail"}')
+        with mock.patch("vigil.net.open_url", return_value=body), \
+                self.assertRaises(PushError) as ctx:
+            feishu.send("hi", TARGET)
+        self.assertIn("sign match fail", str(ctx.exception))
 
 
 class TestCard(unittest.TestCase):
     def test_card_structure(self):
         message = Message("🔴 Ivanti 认证绕过", "CISA KEV · 11-01 21:50 · 严重（CVSS 9.8） · 第 1/1 条",
-                          "【编号】CVE-2026-1111")
-        card = feishu.card_of(message, "red")
+                          "【编号】CVE-2026-1111", template="red")
+        card = feishu.card_of(message)
 
         self.assertEqual(card["header"]["template"], "red")
         self.assertEqual(card["header"]["title"]["content"], "🔴 Ivanti 认证绕过")
@@ -126,7 +146,7 @@ class TestCard(unittest.TestCase):
         self.assertIn("CVE-2026-1111", card["elements"][0]["text"]["content"])
 
     def test_card_without_body_has_no_elements(self):
-        card = feishu.card_of(Message("t", "", ""), "blue")
+        card = feishu.card_of(Message("t", "", ""))
         self.assertEqual(card["elements"], [])
         self.assertNotIn("subtitle", card["header"])
 
@@ -137,7 +157,7 @@ class TestCard(unittest.TestCase):
             captured["body"] = json.loads(request.data.decode("utf-8"))
             return FakeResponse(b'{"code":0}')
 
-        card = feishu.card_of(Message("t", "s", "b"), "orange")
+        card = feishu.card_of(Message("t", "s", "b", template="orange"))
         with mock.patch("vigil.net.open_url", fake):
             feishu.send_card(card, TARGET)
 
@@ -161,7 +181,7 @@ class TestCard(unittest.TestCase):
         self.assertTrue(messages)
         for message in messages:
             payload = feishu._payload(
-                {"msg_type": "interactive", "card": feishu.card_of(message, message.template)},
+                {"msg_type": "interactive", "card": feishu.card_of(message)},
                 TARGET,
             )
             self.assertLess(len(payload), 20000)

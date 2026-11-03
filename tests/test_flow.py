@@ -4,7 +4,7 @@ import json
 import os
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -52,6 +52,8 @@ class FlowCase(unittest.TestCase):
                 "FEISHU_ALLOW_ANY_HOST": "1",
                 "TRANSLATE": "0",
             }),
+            # 消息间隔只为线上限流存在，测试里等 0.25s 纯属浪费（全套 ~38% 的时间）
+            mock.patch("vigil.app.PUSH_INTERVAL", 0),
         ]
         for patcher in patches:
             patcher.start()
@@ -253,6 +255,16 @@ class TestFiltering(FlowCase):
         self.assertIn("Security advisory", self.posts[0])
         self.assertNotIn("Released", self.posts[0])
 
+    def test_items_outside_window_are_not_pushed(self):
+        """window_hours 之外的条目不补推；这条过滤写反了以前测试也全绿。"""
+        self.run_main()
+        old = format_datetime(datetime.now(timezone.utc) - timedelta(days=10))
+        self.feed = ('<?xml version="1.0"?><rss version="2.0"><channel><item>'
+                     "<title>陈年公告</title><link>https://a.test/old</link>"
+                     f"<guid>old</guid><pubDate>{old}</pubDate></item></channel></rss>")
+        self.assertEqual(self.run_main(), 0)
+        self.assertEqual(self.posts, [])
+
     def test_new_source_only_baselines(self):
         self.run_main()
         self.feed = build_rss([("g1", "旧条目", "d1"), ("g2", "新条目", "d2")])
@@ -313,6 +325,169 @@ class TestAlerts(FlowCase):
         for _ in range(4):
             self.run_main()
         self.assertEqual(self.posts, [], "过滤后 0 条是正常情况，不能报'结构变化'")
+
+
+EMPTY_FEED = '<rss version="2.0"><channel><title>t</title></channel></rss>'
+
+
+class TestAlertTruthfulness(FlowCase):
+    """告警必须说真话：既不能把"还没好"说成"已恢复"，也不能把坏源闷死。"""
+
+    def test_failure_then_empty_is_not_reported_as_recovery(self):
+        self.run_main()                      # 基线
+        self.mode = "fail"
+        for _ in range(3):
+            self.run_main()                  # 连续 3 轮失败 → fail 告警
+        self.assertEqual(len(self.posts), 1)
+
+        self.mode = "ok"
+        self.feed = EMPTY_FEED
+        self.run_main()                      # 200 + 0 条：源其实还不健康
+        self.assertEqual(len(self.posts), 1, "空内容不能触发恢复通知")
+
+        self.run_main()
+        self.run_main()                      # 第 3 轮空才是"结构可能变了"
+        self.assertEqual(len(self.posts), 2)
+        self.assertIn("返回空内容", self.posts[-1])
+
+    def test_new_source_that_never_returns_items_alerts(self):
+        """新源一上来就是空：既建不了基线，也不能永远静默（以前 0 告警）。"""
+        self.feed = EMPTY_FEED
+        for _ in range(3):
+            self.run_main()
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("没有解析出任何条目", self.posts[0])
+
+    def test_failure_counter_stops_growing(self):
+        """连续失败计数封顶：否则 state 每轮都变，每 10 分钟一个 commit。"""
+        self.run_main()
+        self.mode = "fail"
+        for _ in range(3):
+            self.run_main()
+        before = self.state_path.read_bytes()
+        self.run_main()
+        self.run_main()
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertEqual(next(iter(self.state()["sources"].values()))["fail"], 3)
+
+    def test_removed_target_does_not_leave_items_stuck(self):
+        """目标群被删掉后，已满足当前目标集合的记录要当场转正，不能等 7 天 TTL。"""
+        second = "https://hook.test/b"
+        with mock.patch.dict(os.environ, {
+            "FEISHU_WEBHOOK": "",
+            "FEISHU_WEBHOOKS": json.dumps([self.webhook, second]),
+        }):
+            self.run_main()
+            self.feed = build_rss([("g2", "新条目", "d2")])
+            self.fail_for = {second}
+            self.assertEqual(self.run_main(), 1)
+            self.assertEqual(len(self.state()["pending"]), 1)
+
+            with mock.patch.dict(os.environ, {
+                "FEISHU_WEBHOOK": self.webhook,
+                "FEISHU_WEBHOOKS": "",
+            }):
+                self.assertEqual(self.run_main(), 0)
+        self.assertEqual(self.state()["pending"], {})
+        # 全程只应推 1 次（A 群那一张卡）；删群那轮不能重推
+        self.assertEqual(len(self.posts), 1)
+
+
+class TestAlertDelivery(FlowCase):
+    """告警链路本身：解析失败、预算跳过、重复提醒、发不出去。"""
+
+    def test_parse_failure_is_counted_and_alerts(self):
+        """解析失败（不是抓取失败）也必须累计 fail 并告警。"""
+        self.run_main()                      # 基线
+        self.feed = "<!doctype html><html><body>WAF</body></html>"
+        for _ in range(2):
+            self.assertEqual(self.run_main(), 0)
+        self.assertEqual(self.posts, [], "没到阈值不该发消息")
+        self.assertEqual(self.run_main(), 0)
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("抓取/解析失败", self.posts[0])
+
+    def test_parser_crash_only_fails_that_source(self):
+        """解析器抛非 ParseError 的意外异常，也只算这个源失败。"""
+        self.run_main()
+        self.feed = build_rss([("g2", "新条目", "d2")])
+
+        def boom(text, source):
+            raise ValueError("parser bug")
+
+        with mock.patch.dict("vigil.collect.PARSERS", {"rss": boom}):
+            for _ in range(3):
+                self.assertEqual(self.run_main(), 0)
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("抓取/解析失败", self.posts[0])
+
+    def test_budget_skip_alerts_after_threshold(self):
+        """被时间预算跳过不是源故障，但连续 3 轮也要提示。"""
+        self.run_main()
+        with mock.patch("vigil.app.FETCH_BUDGET", 0):
+            for _ in range(3):
+                self.assertEqual(self.run_main(), 0)
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("未检查", self.posts[0])
+
+    def test_fetch_budget_exceeded_is_a_skip_not_a_failure(self):
+        """抓取中途预算耗尽也归"本轮跳过"，不能累积成源故障。"""
+        from vigil.models import BudgetExceeded
+
+        self.run_main()
+
+        def exhausted(*args, **kwargs):
+            raise BudgetExceeded("整轮时间预算已耗尽")
+
+        with mock.patch("vigil.collect.fetch", exhausted):
+            for _ in range(3):
+                self.assertEqual(self.run_main(), 0)
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("未检查", self.posts[0])
+
+    def test_failure_alert_repeats_after_six_hours(self):
+        """持续故障每 6 小时提醒一次：只测"不重发"是不够的。"""
+        self.run_main()
+        self.mode = "fail"
+        for _ in range(3):
+            self.run_main()
+        self.assertEqual(len(self.posts), 1)
+
+        raw = self.state()
+        for record in raw["sources"].values():
+            record["alert_at"] -= 7 * 3600
+        self.state_path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+        self.run_main()
+        self.assertEqual(len(self.posts), 2)
+        self.assertIn("抓取/解析失败", self.posts[-1])
+
+    def test_test_mode_reports_delivery_failure(self):
+        with mock.patch("vigil.app.send_card", side_effect=PushError("boom")):
+            self.assertEqual(self.run_main("--test"), 1)
+
+    def test_alert_without_webhook_is_an_error(self):
+        """有告警却发不出去，退出码必须变红，否则没人会去看日志。"""
+        self.run_main()
+        self.mode = "fail"
+        with mock.patch.dict(os.environ, {"FEISHU_WEBHOOK": "", "FEISHU_WEBHOOKS": ""}):
+            status = 0
+            for _ in range(3):
+                status = self.run_main()
+        self.assertEqual(status, 1)
+        self.assertEqual(self.posts, [])
+
+    def test_alert_delivery_failure_sets_exit_code(self):
+        self.run_main()
+        self.mode = "fail"
+        self.run_main()
+        self.run_main()
+        with mock.patch("vigil.app.send", side_effect=PushError("boom")):
+            self.assertEqual(self.run_main(), 1)
+
+    def test_test_mode_without_webhook(self):
+        with mock.patch.dict(os.environ, {"FEISHU_WEBHOOK": "", "FEISHU_WEBHOOKS": ""}):
+            self.assertEqual(self.run_main("--test"), 1)
 
 
 class TestTestMode(FlowCase):

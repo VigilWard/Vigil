@@ -1,4 +1,6 @@
 """文本清洗、时间解析、等级推断与字节截断。"""
+import io
+import time
 import unittest
 from datetime import datetime, timezone
 
@@ -58,6 +60,62 @@ class TestClean(unittest.TestCase):
         self.assertEqual(clean(None), "")
         self.assertEqual(clean(""), "")
 
+    def test_tag_like_prose_is_preserved(self):
+        """<V2.0>、a<b 且 b>c 是正文，不是 HTML 标签，不能被整段吃掉。"""
+        for text in ("升级到 <V2.0> 版本", "如果 a<b 且 b>c 则", "firmware <b and c> d"):
+            self.assertEqual(clean(text), text, text)
+
+    def test_script_and_style_content_is_removed(self):
+        self.assertEqual(clean("<style>body{color:red}</style><p>公告</p>"), "公告")
+        self.assertEqual(clean("<script>var a=1;</script>正文"), "正文")
+
+    def test_style_block_does_not_eat_real_content(self):
+        """先剥 script/style 再截断：否则一段 CSS 就能把正文挤出 MAX_CLEAN_CHARS。"""
+        text = "<style>" + "body{color:red}" * 3000 + "</style><p>真正的公告</p>"
+        self.assertEqual(clean(text), "真正的公告")
+
+    def test_quoted_bracket_inside_tag(self):
+        """属性值里的 '>' 不能把标签截断，否则会漏出半截标签。"""
+        self.assertEqual(clean('<img src=x alt="a>b">'), "")
+
+    def test_boolean_attribute_is_a_tag(self):
+        self.assertEqual(clean('<a href="x" download>PDF</a>'), "PDF")
+
+    def test_escaped_script_and_style_are_removed(self):
+        """JSON 源常把 HTML 二次转义：unescape 之后还要再剥一次，否则 CSS 照样占满摘要。"""
+        text = "<p>&lt;style&gt;" + "b{color:red}" * 100 + "&lt;/style&gt;正文</p>"
+        self.assertEqual(clean(text), "正文")
+
+    def test_malformed_tag_edges_are_kept_as_text(self):
+        """属性没有值、结束标签不完整时，宁可留着也不能误删正文。"""
+        for text in ("<a href=>x", "</>x", "</ 1>x"):
+            self.assertEqual(clean(text), text, text)
+
+    def test_trailing_space_before_tag_end(self):
+        self.assertEqual(clean("<a href=x >文本</a>"), "文本")
+
+    def test_removed_block_does_not_glue_words(self):
+        """删块要补一个空格，否则 "Critical<script>x</script>Update" 会粘成一个词。"""
+        self.assertEqual(clean("Critical<script>x</script>Update"), "Critical Update")
+
+    def test_unclosed_blocks_stay_linear(self):
+        """大量未闭合 <script> 时，不能每个都向文末重搜闭合标签（那是 O(n²)）。
+
+        回归锚点：40k 个未闭合 opener（约 312KB）线性实现约 10ms，
+        退化成"每个都全文搜索"后要 ~1.9s。
+        """
+        from vigil.parse import _strip_raw_blocks
+
+        payload = "<script>" * 40000
+        started = time.perf_counter()
+        self.assertEqual(_strip_raw_blocks(payload), payload)
+        self.assertLess(time.perf_counter() - started, 0.5)
+
+    def test_unclosed_script_keeps_content_but_drops_later_blocks(self):
+        """未闭合的 <script> 可能只是正文在讨论它，不能把后文整段吞掉；
+        但后面成对的 <style> 仍然要剥掉。"""
+        self.assertEqual(clean("<script>var a=1; <style>b{c}</style> 正文"), "var a=1; 正文")
+
 
 class TestShorten(unittest.TestCase):
     def test_char_limit(self):
@@ -97,6 +155,11 @@ class TestTime(unittest.TestCase):
     def test_garbage(self):
         for value in ("not a date", "", None, "null", 0, -5, True):
             self.assertEqual(parse_time(value), 0, value)
+
+    def test_out_of_range_is_zero(self):
+        """ISO / HTTP-date 分支也不能返回 9999 年或负数时间戳。"""
+        for text in ("9999-12-31", "0001-01-01", "1970-01-01T00:00:00Z"):
+            self.assertEqual(parse_time(text), 0, text)
 
 
 class TestSeverity(unittest.TestCase):
@@ -140,6 +203,45 @@ class TestCvss(unittest.TestCase):
 
     def test_out_of_range_ignored(self):
         self.assertEqual(cvss_of("CVSS 3.1: 12.0"), 0.0)
+
+    def test_score_at_end_of_sentence(self):
+        """"with a CVSS of 7.5." 是英文正文最常见的写法，句号不能把分数一起吃掉。"""
+        self.assertEqual(cvss_of("CVSS 9.8."), 9.8)
+        self.assertEqual(cvss_of("with a CVSS of 7.5."), 7.5)
+        self.assertEqual(cvss_of("The CVSS is 9.8. Patch now."), 9.8)
+        self.assertEqual(cvss_of("CVSS 10."), 10.0)
+        self.assertEqual(severity_of("Scored CVSS 9.8."), 4)
+
+    def test_score_over_ten_is_not_truncated(self):
+        """百分制评分不是 CVSS：以前只取两位数字，会把 "score 100" 截成 10 分。"""
+        for text in ("score 100", "Risk score: 100", "CVSS score 100%"):
+            self.assertEqual(cvss_of(text), 0.0, text)
+
+    def test_score_word_must_be_whole(self):
+        self.assertEqual(cvss_of("underscore 8 chars"), 0.0)
+
+    def test_cvss_version_with_colon(self):
+        """"CVSS:3.1 9.8" 里的 3.1 是版本号，不是分数。"""
+        self.assertEqual(cvss_of("CVSS:3.1 9.8"), 9.8)
+        self.assertEqual(cvss_of("CVSS 3.1"), 0.0)
+
+
+class TestSafeWrite(unittest.TestCase):
+    """Windows 的 GBK 控制台打印 emoji 会抛 UnicodeEncodeError，不能连日志一起消失。"""
+
+    class GbkStream(io.StringIO):
+        encoding = "gbk"
+
+        def write(self, text):
+            text.encode("gbk")          # 模拟 GBK 控制台：不可编码的字符会抛异常
+            return super().write(text)
+
+    def test_emoji_falls_back_to_encodable_text(self):
+        from vigil.models import _write
+
+        stream = self.GbkStream()
+        _write("🔴 中文", stream)
+        self.assertIn("中文", stream.getvalue())
 
 
 if __name__ == "__main__":

@@ -1,8 +1,10 @@
 """各源解析器。"""
 import json
+import time
 import unittest
 from datetime import datetime, timezone
 from email.utils import format_datetime
+from unittest import mock
 
 from vigil.models import ParseError, Source
 from vigil.parse import parse_json, parse_kev, parse_nginx, parse_rss
@@ -277,6 +279,101 @@ class TestJsonDuplicates(unittest.TestCase):
                         mapping={"title": "", "id": "id"})
         payload = json.dumps([{"id": "1", "title": "正常标题"}])
         self.assertEqual(parse_json(payload, source)[0].title, "正常标题")
+
+
+class TestRssNamespaces(unittest.TestCase):
+    """同名元素按命名空间区分：扩展模块不能顶替 RSS/Atom 的核心字段。"""
+
+    def _rss(self, body: str) -> str:
+        return ('<?xml version="1.0"?><rss version="2.0" '
+                'xmlns:media="http://search.yahoo.com/mrss/"><channel>'
+                f"<item><title>T</title><guid>1</guid>{body}</item></channel></rss>")
+
+    def test_media_description_does_not_steal_summary(self):
+        """<media:description> 是图片说明，不能替代 <description> 的正文。"""
+        items = parse_rss(self._rss(
+            "<media:description>图片说明</media:description>"
+            "<description>真正的文字摘要</description>"
+        ), SRC)
+        self.assertEqual(items[0].summary, "真正的文字摘要")
+
+    def test_namespaced_description_is_used_when_it_is_the_only_one(self):
+        """只有扩展字段时仍要兜底取到，不要直接丢成空摘要。"""
+        items = parse_rss(self._rss("<media:description>只有图片说明</media:description>"), SRC)
+        self.assertEqual(items[0].summary, "只有图片说明")
+
+    def test_content_encoded_beats_media_description(self):
+        """只有图说 + 正文时，content:encoded 才是摘要，不能被图说顶掉。"""
+        rss = ('<?xml version="1.0"?><rss version="2.0" '
+               'xmlns:media="http://search.yahoo.com/mrss/" '
+               'xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><item>'
+               "<title>T</title><guid>1</guid>"
+               "<media:description>图片说明</media:description>"
+               "<content:encoded><p>完整正文</p></content:encoded>"
+               "</item></channel></rss>")
+        self.assertEqual(parse_rss(rss, SRC)[0].summary, "完整正文")
+
+
+class TestEntityScan(unittest.TestCase):
+    def test_unclosed_cdata_is_not_an_entity_attack(self):
+        """大量未闭合 CDATA 只是畸形输入，不是实体攻击。"""
+        from vigil.parse import _has_entity_declaration
+
+        self.assertFalse(_has_entity_declaration("<![CDATA[" * 500))
+
+    def test_scan_stays_linear_on_unclosed_cdata(self):
+        """回归锚点：O(n²) 实现对 128KB 要约 5 秒，这里是毫秒级。
+
+        上限给到 0.5s，慢机器也不会误报，同时能挡住退回二次复杂度的改动。
+        """
+        from vigil.parse import _has_entity_declaration
+
+        payload = "<![CDATA[" * (128 * 1024 // 9)
+        started = time.perf_counter()
+        self.assertFalse(_has_entity_declaration(payload))
+        self.assertLess(time.perf_counter() - started, 0.5)
+
+    def test_unclosed_spans_are_left_alone(self):
+        from vigil.parse import _drop_spans
+
+        self.assertEqual(_drop_spans("a<!--b", "<!--", "-->"), "a<!--b")
+        self.assertEqual(_drop_spans("a<![CDATA[b]]>c", "<![CDATA[", "]]>"), "ac")
+
+
+class TestStructureGuards(unittest.TestCase):
+    """源站改版时宁可报错（触发告警），也不能静默返回空。"""
+
+    def test_empty_response_is_an_error(self):
+        with self.assertRaises(ParseError):
+            parse_rss("   ", SRC)
+
+    def test_plain_html_root_is_rejected(self):
+        with self.assertRaises(ParseError):
+            parse_rss("<html><body>x</body></html>", SRC)
+
+    def test_too_many_items_are_capped(self):
+        payload = build_rss([(f"g{i}", f"标题 {i}", "d") for i in range(5)])
+        with mock.patch("vigil.parse.MAX_NODES", 2):
+            items = parse_rss(payload, SRC)
+        self.assertEqual(len(items), 2)
+
+    def test_kev_rows_without_valid_cve_is_an_error(self):
+        with self.assertRaises(ParseError):
+            parse_kev('{"vulnerabilities": [{"vendorProject": "x"}]}',
+                      Source("K", "https://a.test/kev.json", kind="kev"))
+
+    def test_broken_json_is_reported(self):
+        with self.assertRaises(ParseError):
+            parse_json("{not json", Source("J", "https://a.test", kind="json", mapping={}))
+
+    def test_json_rows_without_titles_is_an_error(self):
+        with self.assertRaises(ParseError):
+            parse_json('[{"x": 1}]', Source("J", "https://a.test", kind="json", mapping={}))
+
+    def test_truncated_list_item_is_reported(self):
+        html = '<ul><li><p>Severity: high<br>CVE-2026-1111'
+        with self.assertRaises(ParseError):
+            parse_nginx(html, Source("N", "https://nginx.org/x", kind="nginx"))
 
 
 if __name__ == "__main__":

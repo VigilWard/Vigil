@@ -33,7 +33,7 @@ PUSH_ATTEMPTS = 3
 
 
 class _BusinessError(PushError):
-    """业务错误（签名错、webhook 失效），重试没有意义。"""
+    """业务错误（签名错、webhook 失效、返回了非 JSON 的错误页），重试没有意义。"""
 
 
 class _RateLimited(PushError):
@@ -58,14 +58,14 @@ def _payload(body: dict, target: PushTarget) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8", "replace")
 
 
-def card_of(message: Message, template: str) -> dict:
+def card_of(message: Message) -> dict:
     """把一条消息包成消息卡片。
 
     颜色只出现在三处：头部模板色、等级、勒索/在野利用标记——其余保持正文原样，
     避免给动态文本套样式带来的转义风险。
     """
     header: dict = {
-        "template": template,
+        "template": message.template,
         "title": {"tag": "plain_text", "content": message.title},
     }
     if message.subtitle:
@@ -80,19 +80,23 @@ def _check_response(raw: bytes) -> None:
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise PushError("飞书返回了非 JSON 响应") from exc
+        # 200 + HTML 一般是 WAF/代理的错误页，等 1.2 秒再撞一次不会变好；
+        # 归到业务错误可以省下每条 3.6 秒的无意义退避。
+        raise _BusinessError("飞书返回了非 JSON 响应") from exc
     if not isinstance(data, dict):
-        raise PushError("飞书响应不是 JSON 对象")
+        raise _BusinessError("飞书响应不是 JSON 对象")
 
     if "code" in data:
         code, message = data["code"], data.get("msg", "")
     elif "StatusCode" in data:
-        code, message = data["StatusCode"], data.get("msg", "")
+        # 老格式用 StatusMessage 而不是 msg，只读 msg 会让错误信息变成空字符串
+        code = data["StatusCode"]
+        message = data.get("StatusMessage") or data.get("msg", "")
     else:
-        raise PushError("飞书响应缺少 code/StatusCode，无法确认送达")
+        raise _BusinessError("飞书响应缺少 code/StatusCode，无法确认送达")
 
     if type(code) is not int:
-        raise PushError(f"飞书响应状态类型无效：{code!r}")
+        raise _BusinessError(f"飞书响应状态类型无效：{code!r}")
     if code == 0:
         return
     if code in RATE_LIMIT_CODES:

@@ -171,6 +171,46 @@ class TestPending(StateCase):
         self.assertNotIn("s:0", keys)
 
 
+class TestRetire(StateCase):
+    """目标集合变小后，已满足当前目标的记录必须当场转正。"""
+
+    def test_records_satisfied_by_current_targets_are_completed(self):
+        state = State()
+        item = make_item()
+        state.queue(item, 100)
+        state.ack([item.key], "a", {"a", "b"}, 100)
+        self.assertIn(item.key, state.pending)
+
+        self.assertEqual(state.retire({"a"}, 200), 1)     # b 被从配置里删掉了
+        self.assertEqual(state.pending, {})
+        self.assertIn(item.key, state.seen)
+
+    def test_unsatisfied_records_are_kept(self):
+        state = State()
+        item = make_item()
+        state.queue(item, 100)
+        state.retire({"a"}, 200)
+        self.assertIn(item.key, state.pending)
+
+    def test_empty_target_set_does_not_retire_everything(self):
+        """没配 webhook 时不能把整个队列一次清空。"""
+        state = State()
+        item = make_item()
+        state.queue(item, 100)
+        state.retire(set(), 200)
+        self.assertIn(item.key, state.pending)
+
+
+class TestPendingOrder(StateCase):
+    def test_pending_for_keeps_insertion_order_when_undated(self):
+        """无日期条目（NGINX）按入队顺序出队，不能按哈希 key 排。"""
+        state = State()
+        for uid in ("z", "a", "m"):
+            state.queue(Item(source_key="s", source_name="源", uid=uid,
+                             title=uid, published=0), 100)
+        self.assertEqual([item.uid for item in state.pending_for("t")], ["z", "a", "m"])
+
+
 class TestRetention(StateCase):
     def test_old_seen_entries_are_pruned(self):
         state = State()

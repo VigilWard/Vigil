@@ -7,6 +7,7 @@ from vigil.render import (
     card_template,
     compose,
     render_item,
+    sanitize_link,
     select_items,
 )
 
@@ -350,6 +351,57 @@ class TestCompose(unittest.TestCase):
         text = compose(self.config, [item], 1793000000, markup=False)[0].as_text()
         self.assertTrue(text.startswith("🔴 标题一 · "))
         self.assertIn("\n【标题原文】标题一", text)
+
+
+class TestLinkSanitizing(unittest.TestCase):
+    def test_markup_entities_are_removed(self):
+        """lark_md 会解码实体，&#60; 与 &NewLine; 都能绕过字面剔除。"""
+        self.assertNotIn("&#60;", sanitize_link("https://x/?q=&#60;font&#62;"))
+        self.assertNotIn("&NewLine;", sanitize_link("https://e.com/a&NewLine;【等级】严重"))
+
+    def test_query_ampersand_survives(self):
+        url = "https://e.test/a?x=1&amp;y=2"
+        self.assertEqual(sanitize_link(url), url)
+
+    def test_numeric_ampersand_is_normalized(self):
+        """&#38; / &#x26; 就是 &，不能被当成危险实体删掉（否则查询参数被改坏）。"""
+        for token in ("&#38;", "&#x26;", "&#X26;"):
+            self.assertEqual(
+                sanitize_link(f"https://e.test/?a=1{token}b=2"),
+                "https://e.test/?a=1&amp;b=2",
+                token,
+            )
+
+    def test_bare_markup_chars_are_removed(self):
+        self.assertEqual(sanitize_link("https://e.test/a<b>*c*"), "https://e.test/abc")
+
+
+class TestUndatedOrder(unittest.TestCase):
+    def test_limit_keeps_queue_order_not_alphabetical(self):
+        """无日期源（NGINX）不能按标题字母序挑选，否则"最新"变成"字母最靠前"。"""
+        source = Source("NGINX", "https://nginx.org/x", limit=2)
+        config = Config(sources=[source], max_items=5)
+        titles = ["Z 最新", "A 次新", "M 最旧"]
+        items = [
+            Item(source_key=source.key, source_name=source.name, uid=f"u{index}",
+                 title=title, published=0)
+            for index, title in enumerate(titles)
+        ]
+        selected, deferred = select_items(config, items)
+        self.assertEqual([item.title for item in selected], ["Z 最新", "A 次新"])
+        self.assertEqual(deferred, 1)
+
+    def test_compose_keeps_queue_order(self):
+        """端到端再锁一遍：select_items 之后还有 _rank 的排序。"""
+        source = Source("NGINX", "https://nginx.org/x", limit=3)
+        config = Config(sources=[source], max_items=5)
+        titles = ["Z 最新", "A 次新", "M 最旧"]
+        items = [
+            Item(source_key=source.key, source_name=source.name, uid=f"u{index}",
+                 title=title, published=0)
+            for index, title in enumerate(titles)
+        ]
+        self.assertEqual([m.title for m in compose(config, items, 1793000000)], titles)
 
 
 class TestCardTemplate(unittest.TestCase):

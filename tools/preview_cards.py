@@ -67,7 +67,7 @@ def lark_to_html(text: str) -> str:
 
 
 def render_card(message, note: str, code: str) -> str:
-    card = card_of(message, message.template)
+    card = card_of(message)
     head = card["header"]
     title = html_mod.escape(head["title"]["content"])
     subtitle = html_mod.escape(head.get("subtitle", {}).get("content", ""))

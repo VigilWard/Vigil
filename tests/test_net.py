@@ -1,6 +1,7 @@
 """HTTP 层：字节上限、编码嗅探、条件请求与重定向策略。"""
 import gzip
 import io
+import os
 import time
 import unittest
 import urllib.error
@@ -139,6 +140,10 @@ class TestOrigin(unittest.TestCase):
         self.assertEqual(net._origin("https://a.test/x"), ("https", "a.test", 443))
         self.assertEqual(net._origin("http://a.test/x"), ("http", "a.test", 80))
 
+    def test_port_zero_is_not_treated_as_default(self):
+        """端口 0 是 falsy，以前会被当成 443，报错信息完全对不上。"""
+        self.assertEqual(net._origin("https://a.test:0/x"), ("https", "a.test", 0))
+
 
 class TestDecodeCorruption(unittest.TestCase):
     """一个坏字节不能把整篇 UTF-8 变成另一种编码的乱码。"""
@@ -206,6 +211,87 @@ class TestRedirectHeaders(unittest.TestCase):
         request = urllib.request.Request("http://a.test/x", headers={"Authorization": "Bearer t"})
         new = handler.redirect_request(request, None, 301, "Moved", {}, "https://b.test/x")
         self.assertIsNone(new.headers.get("Authorization"))
+
+
+class TestMalformedBodies(unittest.TestCase):
+    def test_odd_length_utf16_does_not_raise(self):
+        """BOM 之后字节数为奇数时，严格解码会抛 UnicodeDecodeError（ValueError 子类），
+        在 fetch 里会被误报成"请求不合法"且不重试。解码必须永不抛。"""
+        for prefix in (b"\xff\xfe", b"\xfe\xff"):
+            for extra in range(1, 12, 2):
+                with self.subTest(prefix=prefix, extra=extra):
+                    self.assertIsInstance(net.decode_bytes(prefix + b"a" * extra), str)
+
+    def test_unknown_content_encoding_is_rejected(self):
+        """不认识 / 链式编码不能把压缩字节原样当正文返回。"""
+        raw = gzip.compress("中文内容".encode())
+        for encoding in ("br", "zstd", "gzip, deflate"):
+            with self.subTest(encoding=encoding):
+                with self.assertRaises(FetchError) as ctx:
+                    net._decompress(raw, encoding, None)
+                # 必须是确定性失败：DecodeError 会被当成"可重试"白跑三次
+                self.assertIs(type(ctx.exception), FetchError)
+
+    def test_unknown_encoding_fails_fast_without_retry(self):
+        response = FakeResponse(gzip.compress(b"x"), {"Content-Encoding": "br"})
+        with mock.patch("vigil.net.open_url", return_value=response) as opener, \
+                self.assertRaises(FetchError):
+            net.fetch("https://a.test/x")
+        self.assertEqual(opener.call_count, 1)
+
+    def test_identity_and_padded_gzip_still_work(self):
+        raw = gzip.compress("中文内容".encode())
+        self.assertEqual(net._decompress(b"plain", "", None), b"plain")
+        self.assertEqual(net._decompress(b"plain", "identity", None), b"plain")
+        self.assertEqual(net._decompress(raw, " gzip ", None), "中文内容".encode())
+
+
+class TestPrivateRedirect(unittest.TestCase):
+    """逃生门只对内网源自己生效：公网源永远不能借跳转进内网。"""
+
+    def test_private_to_private_allowed_with_opt_in(self):
+        handler = net.SafeRedirectHandler()
+        request = urllib.request.Request("http://10.0.0.1/feed")
+        with mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}):
+            new = handler.redirect_request(request, None, 302, "Found", {},
+                                           "https://10.0.0.1/feed")
+        self.assertEqual(new.full_url, "https://10.0.0.1/feed")
+
+    def test_public_source_cannot_redirect_into_private_network(self):
+        handler = net.SafeRedirectHandler()
+        request = urllib.request.Request("https://a.test/x")
+        with mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}), \
+                self.assertRaises(urllib.error.HTTPError):
+            handler.redirect_request(request, None, 302, "Found", {},
+                                     "http://169.254.169.254/")
+
+    def test_redirect_with_invalid_port_is_rejected(self):
+        handler = net.SafeRedirectHandler()
+        request = urllib.request.Request("https://a.test/x")
+        with self.assertRaises(urllib.error.HTTPError):
+            handler.redirect_request(request, None, 302, "Found", {}, "https://a.test:99999/x")
+
+    def test_private_to_private_blocked_without_opt_in(self):
+        handler = net.SafeRedirectHandler()
+        request = urllib.request.Request("http://10.0.0.1/feed")
+        with mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": ""}), \
+                self.assertRaises(urllib.error.HTTPError):
+            handler.redirect_request(request, None, 302, "Found", {}, "https://10.0.0.1/feed")
+
+
+class TestBudgetAndRetryAfter(unittest.TestCase):
+    def test_read_limited_respects_deadline(self):
+        with self.assertRaises(BudgetExceeded):
+            net.read_limited(io.BytesIO(b"x" * 10), 100, time.monotonic() - 1)
+
+    def test_inflate_respects_deadline(self):
+        raw = zlib.compress(b"abc" * 100)
+        with self.assertRaises(BudgetExceeded):
+            net._inflate_limited(raw, time.monotonic() - 1)
+
+    def test_missing_retry_after_returns_none(self):
+        self.assertIsNone(net.retry_after({}))
+        self.assertIsNone(net.retry_after(None))
 
 
 class TestPrivateHost(unittest.TestCase):

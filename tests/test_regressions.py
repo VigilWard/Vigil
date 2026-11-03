@@ -72,8 +72,11 @@ class TestFeishuRateLimit(unittest.TestCase):
         self.assertEqual(opener.call_count, 2)
 
     def test_11232_keeps_retrying_until_attempts_exhausted(self):
-        body = FakeResponse(b'{"code":11232,"msg":"frequency limited"}')
-        with mock.patch("vigil.net.open_url", return_value=body) as opener, \
+        # 每次都要造新的 FakeResponse：同一个 BytesIO 被读空后第二次拿到空 body，
+        # 会被判成"非 JSON"提前收工，看起来像限流只重试了 2 次。
+        body = b'{"code":11232,"msg":"frequency limited"}'
+        with mock.patch("vigil.net.open_url",
+                        side_effect=lambda *a, **k: FakeResponse(body)) as opener, \
                 mock.patch("time.sleep"), self.assertRaises(PushError):
             feishu.send("hi", PushTarget("https://open.feishu.cn/hook/x", ""))
         self.assertEqual(opener.call_count, feishu.PUSH_ATTEMPTS)
@@ -347,7 +350,7 @@ class TestEscapedPayloadSize(unittest.TestCase):
         self.assertTrue(pages)
         for page in pages:
             payload = feishu._payload(
-                {"msg_type": "interactive", "card": feishu.card_of(page, page.template)},
+                {"msg_type": "interactive", "card": feishu.card_of(page)},
                 PushTarget("https://open.feishu.cn/hook/x", "secret"),
             )
             self.assertLess(len(payload), 20000)
@@ -415,6 +418,46 @@ class TestWebhookConfig(unittest.TestCase):
             "FEISHU_WEBHOOKS": "https://open.feishu.cn/hook/a,,",
         }):
             self.assertEqual(len(load_targets()), 1)
+
+    def test_invalid_json_is_rejected(self):
+        from vigil.app import load_targets
+        with mock.patch.dict(os.environ, {"FEISHU_WEBHOOK": "", "FEISHU_WEBHOOKS": "[{oops"}), \
+                self.assertRaises(ConfigError):
+            load_targets()
+
+    def test_non_array_json_is_rejected(self):
+        from vigil.app import load_targets
+        with mock.patch.dict(os.environ, {"FEISHU_WEBHOOK": "", "FEISHU_WEBHOOKS": '{"a": 1}'}), \
+                self.assertRaises(ConfigError):
+            load_targets()
+
+    def test_non_https_webhook_is_rejected(self):
+        from vigil.app import load_targets
+        with mock.patch.dict(os.environ, {
+            "FEISHU_WEBHOOK": "http://open.feishu.cn/hook/a",
+            "FEISHU_WEBHOOKS": "", "FEISHU_ALLOW_ANY_HOST": "",
+        }), self.assertRaises(ConfigError):
+            load_targets()
+
+    def test_non_feishu_host_is_rejected(self):
+        """不是飞书域名就必须显式打开 FEISHU_ALLOW_ANY_HOST，避免把消息发给第三方。"""
+        from vigil.app import load_targets
+        with mock.patch.dict(os.environ, {
+            "FEISHU_WEBHOOK": "https://evil.test/hook/a",
+            "FEISHU_WEBHOOKS": "", "FEISHU_ALLOW_ANY_HOST": "",
+        }), self.assertRaises(ConfigError):
+            load_targets()
+
+    def test_shared_secret_applies_to_string_entries(self):
+        """FEISHU_SECRET 是单目标写法的兼容路径，多目标的字符串项也应继承它。"""
+        from vigil.app import load_targets
+        with mock.patch.dict(os.environ, {
+            "FEISHU_WEBHOOK": "",
+            "FEISHU_WEBHOOKS": "https://open.feishu.cn/hook/a",
+            "FEISHU_SECRET": "s3cret", "FEISHU_ALLOW_ANY_HOST": "",
+        }):
+            targets = load_targets()
+        self.assertEqual(targets[0].secret, "s3cret")
 
 
 class TestHeartbeat(unittest.TestCase):
@@ -773,7 +816,7 @@ class TestCleanInputCap(unittest.TestCase):
         self.assertEqual(len(clean("a" * (MAX_CLEAN_CHARS + 5000))), MAX_CLEAN_CHARS)
 
     def test_pathological_angle_brackets_are_cheap(self):
-        """大量未闭合的 < 曾让 _TAG 在每个位置回溯 4000 次（O(n·4000)）。"""
+        """大量未闭合的 < 曾让旧的标签正则在每个位置回溯 4000 次（O(n·4000)）。"""
         self.assertEqual(len(clean("<" * 400_000)), MAX_CLEAN_CHARS)
 
     def test_less_than_in_prose_is_not_swallowed(self):
@@ -1218,7 +1261,7 @@ class TestAlertChunking(unittest.TestCase):
         """单条告警超过纯文本预算时要截断，不能把超长消息发给飞书。"""
         from vigil.app import Alert, _alert_chunks
 
-        alert = Alert("fail", "k", "n", "x" * 500, set())
+        alert = Alert("fail", "k", "x" * 500, set())
         chunks = list(_alert_chunks([alert], 100))
         self.assertEqual(len(chunks), 1)
         self.assertLessEqual(len(chunks[0][0][1].encode("utf-8")), 100)

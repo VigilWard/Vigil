@@ -79,8 +79,9 @@ MAX_NAME_CHARS = 80
 # 几十万字的 HTML 做十几次正则替换——那是白烧 CPU，也是拒绝服务的入口。
 MAX_CLEAN_CHARS = 20000
 # 单个源一次最多解析多少条，防止超大 feed 撑爆内存和 state。
-# 必须大于 CISA KEV 目录的规模（已超 1000 条），否则每轮都会触发截断告警。
-MAX_NODES = 2000
+# 必须明显大于 CISA KEV 目录的规模（2026-11 实测 1766 条，每月约 +30），
+# 否则每轮都会触发"条目过多"截断并打一行告警。5000 留了约 9 年余量。
+MAX_NODES = 5000
 
 
 class VigilError(Exception):
@@ -381,11 +382,32 @@ class Report:
     skipped: list[Failure] = field(default_factory=list)
 
 
+def _write(text: str, stream) -> None:
+    """写一行；终端编码撑不住时（例如 Windows 的 GBK 控制台）降级成可编码字符。
+
+    卡片正文里有 emoji，`print` 到 cp936 会抛 UnicodeEncodeError；日志里
+    一句 "错误：..." 也跟着一起消失，表现成"什么都不打印、退出码 2"。
+    """
+    try:
+        print(text, file=stream, flush=True)
+        return
+    except UnicodeEncodeError:
+        pass
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    print(text.encode(encoding, "replace").decode(encoding, "replace"),
+          file=stream, flush=True)
+
+
+def echo(text: str) -> None:
+    """打印正文（--dry-run 用）。只负责"不因为编码问题崩掉"，不做格式化。"""
+    _write(text, sys.stdout)
+
+
 def log(*args: object) -> None:
     """带时间戳写到 stdout；日志里不出现任何密钥或条目内容。"""
     try:
         stamp = datetime.now(CST).strftime("%H:%M:%S")
-        print(f"[{stamp}]", *args, file=sys.stdout, flush=True)
+        _write(f"[{stamp}] " + " ".join(str(arg) for arg in args), sys.stdout)
     except Exception:  # pragma: no cover - 极端情况下日志失败不应影响主流程
         pass
 

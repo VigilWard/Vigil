@@ -220,9 +220,25 @@ class State:
             if target_id in record.sent:
                 continue
             items.append(Item.from_dict(record.item))
-        # 稳定顺序：新的在前，同时间按 key，保证每轮渲染结果一致
-        items.sort(key=lambda item: (-item.published, item.key))
+        # 新的在前；无日期（published=0）的条目保持入队顺序——稳定排序即可，
+        # 不要再按 key 排，那个是哈希值，等于把"谁先发"交给随机字符串。
+        items.sort(key=lambda item: -item.published)
         return items
+
+    def retire(self, target_ids: set[str], now: int) -> int:
+        """把"当前目标集合已经全部收到"的记录转正，返回转正条数。
+
+        目标被从配置里删掉时，剩下的目标早就收过这条，`pending_for` 会跳过它，
+        也就没有任何消息会再触发 ack；不在这里收尾，它只能等 PENDING_TTL 才清掉。
+        """
+        if not target_ids:
+            return 0
+        retired = 0
+        for record in list(self.pending.values()):
+            if target_ids.issubset(set(record.sent)):
+                self.remember(Item.from_dict(record.item), now)
+                retired += 1
+        return retired
 
     def ack(self, keys: list[str], target_id: str, target_ids: set[str], now: int) -> None:
         """确认一条消息送达：先按目标记账，所有目标都收到后才转正为 seen。"""

@@ -32,15 +32,37 @@ CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,8}", re.I)
 
 # ---------------------------------------------------------------- 文本
 
-# 只认"看起来像标签"的东西：</?字母 …>。
-# 不能用 [^>]*：安全公告里到处都是 "affected versions < 1.2.3"，
-# 那种 < 不是标签，一旦被当成标签就会把后面的正文整段吃掉。
-# 字符类同时排除 < 和 >，遇到未闭合的 < 立刻失败，不会在每个位置上回溯。
-_TAG = re.compile(r"</?[A-Za-z][^<>]{0,2000}>")
+# 只认"看起来像标签"的东西：</?名字 属性…>。
+#   "Affected versions < 1.2.3"  —— < 后面是空格，不是标签
+#   "如果 a<b 且 b>c 则"         —— 属性名里出现中文，不是标签
+#   "升级到 <V2.0> 版本"         —— 名字里有点号，不是标签
+#   "firmware <b and c> d"       —— 属性没有 =，也不是布尔属性，不是标签
+# 以前用 `[^<>]{0,2000}` 兜住一切，上面几种都会被整段吃掉（实测
+# "升级到 <V2.0> 版本" → "升级到 版本"）。现在属性必须是 name=value，
+# 或者 HTML 规范里的布尔属性（它们本来就允许不带值）。
+_BOOLEAN_ATTRS = frozenset({
+    "allowfullscreen", "async", "autofocus", "autoplay", "checked", "compact",
+    "controls", "declare", "default", "defer", "disabled", "download",
+    "formnovalidate", "hidden", "inert", "ismap", "itemscope", "loop",
+    "multiple", "muted", "nohref", "nomodule", "noresize", "noshade",
+    "novalidate", "nowrap", "open", "playsinline", "readonly", "required",
+    "reversed", "selected",
+})
+# 标签名允许的字符（首字符必须是 ASCII 字母）
+_TAG_NAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:-"
+)
+_ATTR_NAME = re.compile(r"[A-Za-z_:][-A-Za-z0-9_:.]*")
+# 一个标签最多看这么多字符，超过就当正文（防止畸形输入拖慢扫描）
+_MAX_TAG_CHARS = 2000
 # 注释单独处理：它不是标签，但也不该出现在摘要里。长度有上限，不会回溯爆炸。
 _COMMENT = re.compile(r"<!--.{0,2000}?-->", re.S)
-# CDATA 是惰性文本：里面的 "<!ENTITY" 只是正文，不是声明。
-_CDATA = re.compile(r"<!\[CDATA\[.*?\]\]>", re.S)
+# script/style 的**内容**也要去掉：只剥标签会把整段 CSS/JS 留在摘要里，
+# 一个几万字的 <style> 块还会把真正的公告挤出 MAX_CLEAN_CHARS（实测整条摘要
+# 变成 19993 个字符的 "body{color:red}"）。
+_RAW_OPEN = re.compile(r"<(script|style)\b[^<>]{0,2000}>", re.I)
+_CLOSE_SCRIPT = re.compile(r"</script\s*>", re.I)
+_CLOSE_STYLE = re.compile(r"</style\s*>", re.I)
 _IMAGE = re.compile(r"!\[([^\]]{0,200})\]\([^)]{0,500}\)")
 _LINK = re.compile(r"\[([^\]]{0,300})\]\([^)]{0,500}\)")
 _HEADING = re.compile(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+")
@@ -63,26 +85,183 @@ _POSTED_BY = re.compile(
 _ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\ufeff\u00ad"), None)
 
 
+def _drop_spans(text: str, opener: str, closer: str) -> str:
+    """线性删掉 opener…closer 之间的内容；遇到第一个未闭合的 opener 就停手。
+
+    不用 `.*?` 正则：未闭合时每个 opener 都要一路扫到文末，整体退化成 O(n²)
+    （实测 256KB 的畸形 CDATA 要 20 秒，16MB 能把整轮钉死）。
+    """
+    parts: list[str] = []
+    pos = 0
+    while True:
+        start = text.find(opener, pos)
+        if start < 0:
+            break
+        end = text.find(closer, start + len(opener))
+        if end < 0:
+            break
+        parts.append(text[pos:start])
+        pos = end + len(closer)
+    if not parts:
+        return text
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+def _strip_raw_blocks(text: str) -> str:
+    """去掉 <script>/<style> 及其内容：正文里的 CSS/JS 不属于摘要。"""
+    parts: list[str] = []
+    pos = 0            # 还没写进 parts 的起点
+    cursor = 0         # 下一次查找 opener 的位置
+    missing: set[str] = set()
+    while True:
+        opening = _RAW_OPEN.search(text, cursor)
+        if not opening:
+            break
+        name = opening.group(1).lower()
+        if name in missing:
+            # 这个类型后面已经没有闭合标签了，跳过即可（原文保留），
+            # 避免每个未闭合的 opener 都再向文末搜一遍（那是 O(n²)）。
+            cursor = opening.end()
+            continue
+        closer = _CLOSE_SCRIPT if name == "script" else _CLOSE_STYLE
+        closing = closer.search(text, opening.end())
+        if not closing:
+            # 没有闭合标签：保留这一段。安全公告经常在正文里讨论 "<script>" 标签，
+            # 一律删到文末会把后面的内容全吞掉；跳过这个 opener 继续找后面成对的块。
+            missing.add(name)
+            cursor = opening.end()
+            continue
+        parts.append(text[pos:opening.start()])
+        # 块原来的位置补一个空格：否则 "Critical<script>x</script>Update"
+        # 会被拼成 "CriticalUpdate"（旧实现只剥标签，正好留下了空格）。
+        parts.append(" ")
+        pos = closing.end()
+        cursor = closing.end()
+    if not parts:
+        return text
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+def _valid_attrs(body: str) -> bool:
+    """标签名之后、'>' 之前的部分是否合法：属性必须 name=value 或布尔属性。"""
+    index, total = 0, len(body)
+    while index < total:
+        while index < total and body[index].isspace():
+            index += 1
+        if index >= total:
+            return True
+        if body[index] == "/":              # 自闭合
+            return body[index + 1:].strip() == ""
+        match = _ATTR_NAME.match(body, index)
+        if not match:
+            return False
+        name = match.group(0).lower()
+        index = match.end()
+        while index < total and body[index].isspace():
+            index += 1
+        if index < total and body[index] == "=":
+            index += 1
+            while index < total and body[index].isspace():
+                index += 1
+            if index < total and body[index] in "\"'":
+                close = body.find(body[index], index + 1)
+                if close < 0:
+                    return False
+                index = close + 1
+            else:
+                start = index
+                while index < total and not body[index].isspace() \
+                        and body[index] not in "\"'<>":
+                    index += 1
+                if index == start:
+                    return False
+        elif name not in _BOOLEAN_ATTRS:
+            return False
+    return True
+
+
+def _tag_end(text: str, start: int) -> int:
+    """从 '<' 起判断是不是标签：是则返回 '>' 之后的下标，否则 -1。"""
+    total = len(text)
+    index = start + 1
+    if index < total and text[index] == "/":
+        index += 1
+    if index >= total:
+        return -1
+    head = text[index]
+    if not (head.isascii() and head.isalpha()):
+        return -1
+    limit = min(total, start + _MAX_TAG_CHARS)
+    name_end = index + 1
+    while name_end < limit and text[name_end] in _TAG_NAME_CHARS:
+        name_end += 1
+    quote = ""
+    cursor = name_end
+    while cursor < limit:
+        char = text[cursor]
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == ">":
+            return cursor + 1 if _valid_attrs(text[name_end:cursor]) else -1
+        elif char == "<":
+            return -1
+        cursor += 1
+    return -1
+
+
+def _strip_tags(text: str) -> str:
+    """把标签换成空格；不是标签的 '<' 原样保留。
+
+    手写线性扫描而不是正则：属性语法写成正则会带嵌套量词，
+    形如 `<a href=` 重复几千次就能让回溯爆炸（实测 50KB 要 2.6 秒，
+    旧版 0.3ms）。这里每个字符最多被访问常数次。
+    """
+    parts: list[str] = []
+    pos = 0
+    while True:
+        start = text.find("<", pos)
+        if start < 0:
+            break
+        end = _tag_end(text, start)
+        if end < 0:
+            parts.append(text[pos:start + 1])
+            pos = start + 1
+            continue
+        parts.append(text[pos:start])
+        parts.append(" ")
+        pos = end
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
 def clean(value: str | None) -> str:
     """把 HTML / Markdown 摘要压成一行纯文本。
 
     刻意保守：只处理成对且紧贴文字的强调标记，`a * b * c`、`snake_case_name`
     这类正文里的普通符号必须原样保留。
 
-    入口先截断：摘要最终只留 300 字，为几十万字的正文跑十几次正则纯属浪费，
-    而且给了恶意 feed 一个把 runner 拖死的入口。
+    script/style 先整块去掉再截断：摘要最终只留 300 字，一段 CSS 就足以把
+    真正的公告挤出 MAX_CLEAN_CHARS，顺序反过来等于白截。
     """
     raw = value or ""
     if not isinstance(raw, str):
         raw = str(raw)
-    # 先截断再 sanitize，避免对几十万字的正文做一次全量 encode。
-    text = sanitize_text(raw[:MAX_CLEAN_CHARS])
+    text = sanitize_text(_strip_raw_blocks(raw)[:MAX_CLEAN_CHARS])
     text = html.unescape(text)
+    # 再剥一次 script/style：JSON 源和二次转义源里常见 &lt;style&gt;…&lt;/style&gt;，
+    # 只在 unescape 之前剥，等于漏掉一半（CSS 照样占满 300 字）。
+    # 这段只有 ≤MAX_CLEAN_CHARS，多一遍线性扫描可以忽略。
+    text = _strip_raw_blocks(text)
     text = text.translate(_ZERO_WIDTH)
     # 先统一换行符：邮件列表类源大量用 CRLF，行尾的 \r 会让 ^...$ 类的规则匹配不上
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _COMMENT.sub(" ", text)
-    text = _TAG.sub(" ", text)
+    text = _strip_tags(text)
     text = _IMAGE.sub(r"\1", text)
     text = _LINK.sub(r"\1", text)
     text = _HEADING.sub("", text)
@@ -114,8 +293,22 @@ _EXTRA_FORMATS = (
 )
 
 
+def _stamp_of(moment: datetime) -> int:
+    """datetime → Unix 秒；落在合理区间外一律当成"无日期"。
+
+    以前只有"数字时间戳"那条分支做了范围校验，ISO / HTTP-date / 固定格式
+    三个分支会把 9999-12-31、0001-01-01 原样返回。目前靠 Item 兜底，
+    但那意味着任何新调用点都会继承脏值。
+    """
+    try:
+        stamp = int(moment.timestamp())
+    except (OverflowError, OSError, ValueError):
+        return 0
+    return stamp if 0 < stamp < MAX_TIMESTAMP else 0
+
+
 def parse_time(value) -> int:
-    """把各种常见时间格式转成 Unix 秒；无法识别时返回 0（= 无日期）。"""
+    """把各种常见时间格式转成 Unix 秒；无法识别或超出合理范围时返回 0（= 无日期）。"""
     if value is None or isinstance(value, bool):
         return 0
     if isinstance(value, (int, float)):
@@ -142,7 +335,7 @@ def parse_time(value) -> int:
             parsed = datetime.fromisoformat(normalized)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
-            return int(parsed.timestamp())
+            return _stamp_of(parsed)
         except (ValueError, OverflowError, OSError):
             pass
 
@@ -151,14 +344,14 @@ def parse_time(value) -> int:
         if parsed is not None:
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
-            return int(parsed.timestamp())
+            return _stamp_of(parsed)
     except (TypeError, ValueError, OverflowError):
         pass
 
     for fmt in _EXTRA_FORMATS:
         try:
             parsed = datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
-            return int(parsed.timestamp())
+            return _stamp_of(parsed)
         except ValueError:
             continue
     return 0
@@ -178,16 +371,22 @@ _SEVERITY_WORDS = {
 _SEVERITY_LABEL = re.compile(
     r"severity\s*[:：]\s*(critical|high|important|medium|moderate|low|none)", re.I
 )
-_SCORE_LABEL = re.compile(r"(?:base\s+)?score\s*[:：=]?\s*(\d{1,2}(?:\.\d)?)", re.I)
+# "score" 必须整词出现（否则 "underscore 8 chars" 会被当成 8 分），
+# 分数允许三位数再交给范围校验——以前 \d{1,2} 会把 "score 100" 截成 10 分。
+_SCORE_LABEL = re.compile(
+    r"\b(?:base\s+)?score\s*[:：=]?\s*(\d{1,3}(?:\.\d)?)(?!\d)(?!\.\d)", re.I
+)
 _CVSS_VALUE = re.compile(r"cvss[^\d]{0,12}v?\d(?:\.\d)?\s*[:：]\s*(\d{1,2}(?:\.\d)?)", re.I)
-_CVSS_VERSION = re.compile(r"cvss\s*v?(\d(?:\.\d)?)", re.I)
+_CVSS_VERSION = re.compile(r"cvss\s*[:：]?\s*v?(\d(?:\.\d)?)", re.I)
 _CVSS_VECTOR = re.compile(r"CVSS:\d\.\d/[A-Z:/]+", re.I)
 _CVSS_CONTEXT = re.compile(r"cvss|score|severity|评分|风险", re.I)
 # CVSS 版本号只有这几个；"CVSS 9.8" 里的 9.8 是分数，不能当版本剥掉。
 _CVSS_KNOWN_VERSIONS = frozenset({"2.0", "3.0", "3.1", "4.0"})
 # 没有小数点的分数（CVSS 10 / CVSS 9）；要求前面是 cvss 且后面不是数字或点。
-_CVSS_INT = re.compile(r"cvss\s*[:：=]?\s*(\d{1,2})(?![\d.])", re.I)
-_DECIMAL = re.compile(r"(?<![\d.])(\d{1,2}\.\d)(?![.\d])")
+# 句末的句号不算"点"："(?!\d)(?!\.\d)" 允许 "CVSS 10."，但挡住 "CVSS 3.1"。
+_CVSS_INT = re.compile(r"cvss\s*[:：=]?\s*(\d{1,2})(?!\d)(?!\.\d)", re.I)
+# 同理：以前 (?![.\d]) 把句末句号也拒了，"CVSS 9.8." 直接解析成 0 分。
+_DECIMAL = re.compile(r"(?<![\d.])(\d{1,2}\.\d)(?!\d)(?!\.\d)")
 
 
 def _level_of(score: float) -> int:
@@ -337,7 +536,11 @@ def _has_entity_declaration(payload: str) -> bool:
     把这种源永久判成攻击会静默丢掉整条流。真正的实体声明不可能藏在 CDATA 里生效，
     所以先剔除惰性文本再判断是安全的。
     """
-    markup = _CDATA.sub("", _COMMENT.sub("", payload))
+    # 绝大多数响应根本没有 <!ENTITY：先做一次 O(n) 全文搜索，命中才去剔除惰性文本。
+    # 之前无条件先跑 CDATA/注释剔除，畸形输入（大量未闭合 <![CDATA[）能让一轮卡几十分钟。
+    if not _ENTITY_DECL.search(payload):
+        return False
+    markup = _drop_spans(_drop_spans(payload, "<!--", "-->"), "<![CDATA[", "]]>")
     return bool(_ENTITY_DECL.search(markup))
 
 
@@ -345,15 +548,56 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].rsplit(":", 1)[-1].lower()
 
 
-def _first(node: ET.Element, *names: str) -> str:
-    """按 names 的优先级取第一个非空子节点文本。"""
-    for name in names:
-        for child in node:
-            if _local(child.tag) == name:
-                text = "".join(child.itertext()).strip()
-                if text:
-                    return text
+def _namespace(tag: str) -> str:
+    if tag.startswith("{"):
+        return tag[1:].split("}", 1)[0]
     return ""
+
+
+# 核心元素所在的命名空间：RSS 2.0 没有命名空间，RSS 1.0 和 Atom 各有一个。
+# 扩展模块（media:/itunes:/dc:）也带命名空间，同名时必须让核心元素优先——
+# WordPress 类源常同时输出 <media:description>（图片说明）和 <description>（正文），
+# 只比 localname 会让图片说明抢走摘要。
+_CORE_NAMESPACES = frozenset({
+    "",
+    "http://www.w3.org/2005/Atom",
+    "http://purl.org/rss/1.0/",
+    "http://my.netscape.com/rdf/simple/0.9/",
+})
+# content:encoded 是"正文"的正规来源，比 media:/itunes: 这类附件描述更该被选中
+_CONTENT_MODULE = "http://purl.org/rss/1.0/modules/content/"
+_EXTENSION_RANK = 2
+
+
+def _namespace_rank(tag: str) -> int:
+    namespace = _namespace(tag)
+    if namespace in _CORE_NAMESPACES:
+        return 0
+    if namespace == _CONTENT_MODULE:
+        return 1
+    return _EXTENSION_RANK
+
+
+def _first(node: ET.Element, *names: str) -> str:
+    """按 names 的优先级取非空子节点文本，命名空间比名字顺序更优先。
+
+    排序键是 (命名空间等级, 名字序号)：核心字段永远赢；没有核心字段时
+    content:encoded 赢过 media:description（否则"只有图说 + 正文"的源
+    会把图说当摘要）。
+    """
+    best_key: tuple[int, int] | None = None
+    best_text = ""
+    for name_index, name in enumerate(names):
+        for child in node:
+            if _local(child.tag) != name:
+                continue
+            text = "".join(child.itertext()).strip()
+            if not text:
+                continue
+            key = (_namespace_rank(child.tag), name_index)
+            if best_key is None or key < best_key:
+                best_key, best_text = key, text
+    return best_text
 
 
 def _atom_link(node: ET.Element) -> str:
@@ -554,6 +798,9 @@ def parse_json(text: str, source: Source) -> list[Item]:
 # ---------------------------------------------------------------- nginx 公告页
 
 _PARA = re.compile(r"<p\b[^>]{0,200}>(.*?)</p>", re.I | re.S)
+_P_CLOSE = re.compile(r"</p\s*>", re.I)
+# nginx 的公告块一定带 "Severity:" 行；用不含捕获的线性正则判断，避免 lower() 复制整段
+_SEVERITY_WORD = re.compile(r"severity", re.I)
 _BR = re.compile(r"<br\s*/?>", re.I)
 _LINK_TAG = re.compile(r"<a\b[^>]{0,300}>(.*?)</a>", re.I | re.S)
 _A_HREF = re.compile(r"""<a\b[^>]{0,300}?href\s*=\s*["']([^"']{1,600})["']""", re.I)
@@ -597,13 +844,26 @@ def _list_items(text: str):
 def parse_nginx(text: str, source: Source) -> list[Item]:
     items: list[Item] = []
     for block in _list_items(text):
-        para = _PARA.search(block)
+        # 先把搜索范围压到第一个 </p>：单个超长 <li> 里若全是未闭合的 <p>，
+        # `.*?</p>` 会从每个 <p> 一路扫到文末，整体 O(n²)
+        # （实测 256KB 的畸形页面要 89 秒）。
+        close = _P_CLOSE.search(block)
+        if not close:
+            continue
+        para = _PARA.search(block[: close.end()])
         if not para:
             continue
-        raw = para.group(1)
+        # "severity" 在整段里判断（线性正则，不受下面的截断影响），否则一条
+        # 超长公告会因为 Severity 那行被切掉而整条消失。
+        full = para.group(1)
+        if not _SEVERITY_WORD.search(full):
+            continue
+        # 后面的清洗/unwrap 只看前 MAX_CLEAN_CHARS 个字符：摘要本来只留 300 字，
+        # 没必要为几十万字的段落白烧 CPU（也能挡住未闭合 <a> 的二次复杂度）。
+        raw = full[:MAX_CLEAN_CHARS]
         parts = _BR.split(raw)
         title = clean(parts[0])
-        if not title or "severity" not in raw.lower():
+        if not title:
             continue
         cves = _cves(raw)
         details = []

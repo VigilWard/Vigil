@@ -31,6 +31,7 @@ from .models import (
     PushTarget,
     Report,
     VigilError,
+    echo,
     log,
 )
 from .render import Message, compose, shorten_bytes
@@ -41,7 +42,6 @@ from .state import State, load_state
 class Alert:
     kind: str
     key: str
-    name: str
     text: str
     # 这一条该发给哪些目标。多群时不同群的送达进度不一样，不能一把梭发给所有人。
     targets: set[str] = field(default_factory=set)
@@ -94,9 +94,8 @@ def load_targets() -> list[PushTarget]:
     seen: set[str] = set()
     for entry in entries:
         if isinstance(entry, str):
+            # 上面的预过滤已经把空串剔掉了，这里不必再判空
             webhook, secret = entry.strip(), shared_secret
-            if not webhook:
-                continue        # 逗号/换行分隔时尾部空项是常态
         elif isinstance(entry, dict) and set(entry) <= {"webhook", "secret"}:
             webhook = entry.get("webhook", "")
             secret = entry.get("secret", shared_secret)
@@ -151,14 +150,17 @@ def build_alerts(
             kind = "fail"
         elif health.skipped >= SKIP_ALERT:
             kind = "skip"
-        elif health.empty >= EMPTY_ALERT and health.had_items:
+        elif health.empty >= EMPTY_ALERT:
             kind = "empty"
 
         if not kind:
-            # 恢复通知只发给"确实收到过告警"的那些目标
+            # 恢复通知只发给"确实收到过告警"的那些目标。
+            # 必须要求 empty == 0：fail 之后只要来一轮"200 + 0 条"，
+            # fail 就清零、empty 才 1，此时源其实还不健康，发"已恢复正常"
+            # 会立刻被 3 轮后的"返回空内容"打脸。
             stale = {tid for tid, sent in health.alert_sent.items() if sent}
-            if stale & targets:
-                alerts.append(Alert("recovered", source.key, source.name,
+            if health.empty == 0 and stale & targets:
+                alerts.append(Alert("recovered", source.key,
                                     f"✅ {source.name} 已恢复正常。", stale & targets))
             continue
 
@@ -179,9 +181,14 @@ def build_alerts(
             text = f"⚠ {source.name} 已连续 {health.fail} 轮抓取/解析失败，请检查源地址或页面结构。"
         elif kind == "skip":
             text = f"⚠ {source.name} 已连续 {health.skipped} 轮因时间预算不足未检查，源可能太慢。"
+        elif health.had_items:
+            text = f"⚠ {source.name} 已有内容，但已连续 {health.empty} 轮返回空内容，页面结构可能已变化。"
         else:
-            text = f"⚠ {source.name} 曾有内容，但已连续 {health.empty} 轮返回空内容，页面结构可能已变化。"
-        alerts.append(Alert(kind, source.key, source.name, text, need))
+            # 新接入的源一次都没解析出条目：多半是地址写错、或者 match 之外的原因。
+            # 以前这种情况既不计 empty 也不告警，源会永远静默。
+            text = (f"⚠ {source.name} 接入后连续 {health.empty} 轮没有解析出任何条目，"
+                    "请检查源地址与解析规则。")
+        alerts.append(Alert(kind, source.key, text, need))
     return alerts
 
 
@@ -264,16 +271,27 @@ def _deliver(
     deadline: float,
 ) -> bool:
     """把待送达队列推给每个目标；每确认一条就立即落盘。"""
+    if not targets:
+        if not state.pending:
+            return True
+        log(f"有 {len(state.pending)} 条待送达，但未配置飞书 webhook；内容不会写进公开日志。")
+        return False
+
+    target_ids = {target.tid for target in targets}
+    # 目标集合可能比上一轮小了（删掉某个群）。已经满足当前集合的记录不会再被
+    # 任何 target 选中，不在这里转正就只能等 7 天 TTL，白占队列。
+    # 转正后必须立刻落盘：这支分支不会再发消息，也就没有别的地方会 save。
+    retired = state.retire(target_ids, now)
+    if retired:
+        state.save(state_path)
+        # 转正意味着"不再补发"，删错配置时这行日志是唯一的线索
+        log(f"   目标集合变小：{retired} 条待送达记录已转正（不会再补发）")
     if not state.pending:
         # 没有待送达条目就不发卡片：源异常提示只在"本来就要发消息"时搭车，
         # 否则一个坏掉的源会让群里每 10 分钟收到一条空卡片。持续性故障由
         # build_alerts() 的 3 轮阈值 + 6 小时节流单独告警。
         return True
-    if not targets:
-        log(f"有 {len(state.pending)} 条待送达，但未配置飞书 webhook；内容不会写进公开日志。")
-        return False
 
-    target_ids = {target.tid for target in targets}
     ok = True
     for target in targets:
         items = merge(state.pending_for(target.tid), config)
@@ -288,7 +306,7 @@ def _deliver(
         )
         for index, message in enumerate(messages, 1):
             try:
-                send_card(card_of(message, message.template), target, deadline=deadline)
+                send_card(card_of(message), target, deadline=deadline)
             except PushError as exc:
                 log(f"⚠ 推送到 {target.tid} 失败：{exc}；未确认的消息会留在队列里")
                 ok = False
@@ -356,10 +374,14 @@ def cmd_dry_run(config: Config, state_path) -> int:
     for failure in report.failures:
         log(f"⚠ {failure.name}：{failure.detail}")
 
-    new_sources = [source.name for source in config.sources
-                   if not state.health(source.key).initialized]
-    if new_sources:
-        log(f"注：{'、'.join(new_sources)} 还没有基线，首次真实运行只会记录基线、不推送这批内容。")
+    new_keys = {source.key for source in config.sources
+                if not state.health(source.key).initialized}
+    if new_keys:
+        names = [source.name for source in config.sources if source.key in new_keys]
+        # 用 merge 之前的集合统计：跨源合并会把新源条目并进老源的 winner
+        count = sum(1 for item in report.items if item.source_key in new_keys)
+        log(f"注：{'、'.join(names)} 还没有基线；本轮它们产出 {count} 条，"
+            "首次真实运行只建基线、不会推送。")
     if pending:
         log(f"注：队列里还有 {len(pending)} 条上一轮没送达的，会一起发。")
 
@@ -374,8 +396,9 @@ def cmd_dry_run(config: Config, state_path) -> int:
     for index, message in enumerate(messages, 1):
         size = len(message.as_text().encode("utf-8", "replace"))
         log(f"--- 第 {index}/{len(messages)} 条，{size} 字节（终端里不显示颜色和加粗） ---")
-        print(message.as_text())
-    log(f"dry-run：{len(items)} 条，{len(messages)} 条消息。未发送、未改动基线。")
+        echo(message.as_text())
+    log(f"dry-run：候选 {len(items)} 条，本轮会发 {len(messages)} 条消息"
+        f"（超出每源 limit / 单轮上限的部分顺延）。未发送、未改动基线。")
     return 0
 
 
@@ -405,7 +428,7 @@ def cmd_test() -> int:
         return 1
     # 发一张真实的卡片：既验证 webhook 和签名，也验证卡片渲染
     message = sample_message()
-    card = card_of(message, message.template)
+    card = card_of(message)
     deadline = time.monotonic() + RUN_BUDGET
     failed = False
     for target in targets:
