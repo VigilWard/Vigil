@@ -279,7 +279,9 @@ TEMPLATE = """<!doctype html>
   <h2>六、字段规则速查</h2>
   <table>
     <tr><th>字段</th><th>何时出现</th><th>样式</th></tr>
+    <tr><td>【来源】</td><td>总是</td><td>config.json 里的 name，纯文本</td></tr>
     <tr><td>【编号】</td><td>有条目带 CVE 时</td><td>多个用「、」连接，纯文本</td></tr>
+    <tr><td>【发布时间】</td><td>源里能读到发布时间时</td><td>东八区，YYYY-MM-DD HH:MM</td></tr>
     <tr><td>【标题翻译】</td><td>有译文且与原文不同</td><td>加粗；开头重复的 CVE 号会被剥掉</td></tr>
     <tr><td>【标题原文】</td><td>总是</td><td>没有译文时由它加粗，充当主标题</td></tr>
     <tr><td>【等级】</td><td>源里能读到等级时</td><td>严重/高危红、低灰、中不着色，有分数时附 CVSS</td></tr>

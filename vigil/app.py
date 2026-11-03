@@ -384,7 +384,9 @@ def sample_message() -> Message:
     return Message(
         "🔴 Vigil 测试消息",
         "webhook、签名与卡片渲染正常 · 严重（CVSS 9.8） · 第 1/1 条",
+        "【来源】Vigil 测试源\n"
         "【编号】CVE-2026-00000\n"
+        "【发布时间】2026-11-01 09:15\n"
         "【标题翻译】**这是一条样式测试消息**\n"
         "【标题原文】This is a style test message\n"
         "【等级】<font color='red'>严重（CVSS 9.8）</font>\n"

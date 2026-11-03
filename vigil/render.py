@@ -151,9 +151,18 @@ def render_item(item: Item, *, markup: bool = True) -> str:
     translated_title = bool(title_zh) and title_zh != title
 
     lines = []
+    # 来源放第一行：一条公告一条消息之后，卡片标题是公告本身，源名只出现在
+    # 副标题里不够显眼；消息被转发或截图出去时也要能一眼看出是哪家源。
+    source_name = _inline(item.source_name)
+    if source_name:
+        lines.append("【来源】" + (escape_md(source_name) if markup else source_name))
     if item.cves:
         cve_text = "、".join(item.cves)
         lines.append("【编号】" + (escape_md(cve_text) if markup else cve_text))
+    if item.published:
+        # 统一按东八区展示：runner 的本地时区不可控，不能用 datetime.fromtimestamp(ts)
+        published = datetime.fromtimestamp(item.published, CST).strftime("%Y-%m-%d %H:%M")
+        lines.append("【发布时间】" + published)
 
     # 加粗只给"主行"：有译文时是译文，没译文时是原文
     if translated_title:

@@ -27,14 +27,37 @@ def items_for(config, count, **kwargs):
             for i in range(count)]
 
 
+def field_of(text: str, name: str) -> str | None:
+    """按字段名取值，避免测试依赖"第几行"——字段顺序以后还会调整。"""
+    prefix = f"【{name}】"
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):]
+    return None
+
+
 class TestRenderItem(unittest.TestCase):
     def test_field_layout(self):
         text = render_item(make_item(1, summary="摘要", cves=("CVE-2026-1111",)), markup=False)
-        lines = text.splitlines()
-        self.assertEqual(lines[0], "【编号】CVE-2026-1111")
-        self.assertEqual(lines[1], "【标题原文】标题 1")
-        self.assertEqual(lines[2], "【摘要原文】摘要")
-        self.assertEqual(lines[3], "【链接】https://e.test/1")
+        labels = [line.split("】", 1)[0][1:] for line in text.splitlines()]
+        self.assertEqual(labels, ["来源", "编号", "发布时间", "标题原文", "摘要原文", "链接"])
+        self.assertEqual(field_of(text, "来源"), "源A")
+        self.assertEqual(field_of(text, "编号"), "CVE-2026-1111")
+        self.assertEqual(field_of(text, "标题原文"), "标题 1")
+        self.assertEqual(field_of(text, "摘要原文"), "摘要")
+        self.assertEqual(field_of(text, "链接"), "https://e.test/1")
+
+    def test_published_time_is_cst(self):
+        """发布时间统一按东八区展示：同一时间戳在 UTC 下是 07:33，不能跟着 runner 的时区走。"""
+        item = Item(source_key="s", source_name="源A", uid="1", title="标题",
+                    published=1793000000)
+        self.assertEqual(field_of(render_item(item, markup=False), "发布时间"),
+                         "2026-10-26 15:33")
+
+    def test_published_line_omitted_when_unknown(self):
+        """没有发布时间的源（如 NGINX）不显示空字段。"""
+        item = Item(source_key="s", source_name="源A", uid="1", title="标题", published=0)
+        self.assertNotIn("【发布时间】", render_item(item, markup=False))
 
     def test_cve_prefix_stripped_from_title(self):
         item = make_item(1, title="CVE-2026-118636: Apache MINA: Unsafe Deserialization",
@@ -47,19 +70,25 @@ class TestRenderItem(unittest.TestCase):
 
     def test_multiple_cves_on_one_line(self):
         item = make_item(1, cves=("CVE-2026-40001", "CVE-2026-40002"))
-        self.assertEqual(render_item(item, markup=False).splitlines()[0],
-                         "【编号】CVE-2026-40001、CVE-2026-40002")
+        lines = render_item(item, markup=False).splitlines()
+        self.assertIn("【编号】CVE-2026-40001、CVE-2026-40002", lines)
 
     def test_missing_cve_omits_line(self):
         text = render_item(make_item(1, cves=()), markup=False)
         self.assertNotIn("【编号】", text)
-        self.assertTrue(text.startswith("【标题原文】"))
+        self.assertIn("【标题原文】", text)
 
     def test_missing_summary_and_link(self):
         item = make_item(1, summary="", cves=("CVE-2026-1111",))
         item.link = ""
-        self.assertEqual(render_item(item, markup=False).splitlines(),
-                         ["【编号】CVE-2026-1111", "【标题原文】标题 1"])
+        text = render_item(item, markup=False)
+        self.assertNotIn("【摘要原文】", text)
+        self.assertNotIn("【链接】", text)
+
+    def test_source_line_is_always_present(self):
+        """来源要能单独认出来：消息被转发或截图时，源名不能只藏在副标题里。"""
+        self.assertEqual(field_of(render_item(make_item(1, source_name="oss-security"), markup=False),
+                                  "来源"), "oss-security")
 
     def test_severity_line(self):
         item = make_item(1, cves=("CVE-2026-1111",), severity=4)
@@ -75,8 +104,8 @@ class TestRenderItem(unittest.TestCase):
     def test_ransomware_line(self):
         item = make_item(1, summary="摘要", cves=("CVE-2026-1111",))
         item.ransomware = True
-        lines = render_item(item, markup=False).splitlines()
-        self.assertEqual(lines[2], "【标记】已知勒索团伙利用")
+        self.assertEqual(field_of(render_item(item, markup=False), "标记"),
+                         "已知勒索团伙利用")
 
     def test_exploited_mark_is_in_the_body(self):
         """分组标题【在野利用】没有了，这个信号必须落在每条自己的正文里。"""
@@ -93,11 +122,11 @@ class TestRenderItem(unittest.TestCase):
                          summary="English summary", cves=("CVE-2026-1111",))
         item.title_zh = "Ivanti Connect Secure 身份认证绕过"
         item.summary_zh = "这是一段中文摘要"
-        lines = render_item(item, markup=False).splitlines()
-        self.assertEqual(lines[1], "【标题翻译】Ivanti Connect Secure 身份认证绕过")
-        self.assertEqual(lines[2], "【标题原文】Ivanti Connect Secure Authentication Bypass")
-        self.assertIn("【摘要翻译】这是一段中文摘要", lines)
-        self.assertIn("【摘要原文】English summary", lines)
+        text = render_item(item, markup=False)
+        self.assertEqual(field_of(text, "标题翻译"), "Ivanti Connect Secure 身份认证绕过")
+        self.assertEqual(field_of(text, "标题原文"), "Ivanti Connect Secure Authentication Bypass")
+        self.assertIn("【摘要翻译】这是一段中文摘要", text.splitlines())
+        self.assertIn("【摘要原文】English summary", text.splitlines())
 
     def test_no_translation_shows_only_original(self):
         """没译文时不能出现「翻译」标签——标签必须和内容对得上。"""
@@ -118,9 +147,9 @@ class TestRenderItem(unittest.TestCase):
         真实数据经 clean() 处理过不会有换行，但渲染层再兜一次，代价几乎为零。
         """
         item = make_item(1, title="第一行\n第二行", summary="摘要一\n摘要二")
-        lines = render_item(item, markup=False).splitlines()
-        self.assertEqual(lines[0], "【标题原文】第一行 第二行")
-        self.assertEqual(lines[1], "【摘要原文】摘要一 摘要二")
+        text = render_item(item, markup=False)
+        self.assertEqual(field_of(text, "标题原文"), "第一行 第二行")
+        self.assertEqual(field_of(text, "摘要原文"), "摘要一 摘要二")
 
     def test_identical_translation_is_not_repeated(self):
         """译文和原文一样（中文源）时只留一行，别出现两行一模一样的内容。"""
@@ -174,6 +203,12 @@ class TestMarkup(unittest.TestCase):
         text = render_item(item)
         self.assertIn("R&amp;D &#60;script&#62;", text)
         self.assertNotIn("&amp;amp;", text)
+
+    def test_source_name_is_escaped_in_body(self):
+        """源名同样来自配置，正文里的 * 不能把整行吃掉。"""
+        item = make_item(1, source_name="A*B")
+        self.assertIn("【来源】A&#42;B", render_item(item))
+        self.assertIn("【来源】A*B", render_item(item, markup=False))
 
     def test_plain_mode_has_no_markup(self):
         item = make_item(1, severity=4, cvss=9.8)
