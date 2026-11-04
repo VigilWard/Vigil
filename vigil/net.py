@@ -157,7 +157,9 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         try:
             old_origin = _origin(req.full_url)
             new_origin = _origin(newurl)
-        except FetchError as exc:
+        except (FetchError, ValueError) as exc:
+            # urlsplit 对畸形 IPv6 会抛 ValueError；重定向处理器是公共入口，
+            # 统一转成 HTTPError，别让裸 ValueError 冒给调用方。
             raise urllib.error.HTTPError(newurl, code, str(exc), headers, fp) from exc
 
         if new_origin[0] not in ("http", "https") or not new_origin[1]:
@@ -328,7 +330,8 @@ def _inflate_limited(raw: bytes, deadline: float | None,
 
     `require_complete` 给 raw deflate 兜底用：raw 流没有头和校验和，
     随机字节里只要开头几个字节恰好构成一个合法块，就会"解压成功"并把
-    剩下的几十字节当成尾随数据丢掉。必须要求整段刚好解完且有输出。
+    剩下的几十字节当成尾随数据丢掉。必须要求整段刚好解完——尾随数据正是
+    随机字节误判的形态；空流本身是合法的，交给上层当空响应处理。
     （理论上仍无法与精心构造的合法 raw 流区分，但随机/损坏数据已被挡住。）
     """
     engine = zlib.decompressobj(wbits)
@@ -356,11 +359,11 @@ def _inflate_limited(raw: bytes, deadline: float | None,
         # gzip 截断会抛 EOFError，deflate 不会：它只是安静地返回半截内容。
         # 不在这里判定，半截 XML/JSON 会被当成"解析失败"，重试也不会发生。
         raise DecodeError("deflate 流不完整（传输可能被截断）")
-    if require_complete and (engine.unused_data or not out):
+    if require_complete and engine.unused_data:
         # 随机/损坏字节被当成"合法的空块 + 一大段尾随数据"，这是 raw 回退
         # 特有的误判。旧实现（只认 zlib 包装）会抛错并重试，不能在这里
-        # 悄悄返回垃圾。
-        raise DecodeError("deflate 流不完整或没有实际内容")
+        # 悄悄返回垃圾。空输出不拦：那是合法的空流。
+        raise DecodeError("deflate 流末尾存在未消费的数据")
     return b"".join(out)
 
 

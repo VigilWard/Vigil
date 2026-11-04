@@ -196,6 +196,19 @@ class TestDeflateIntegrity(unittest.TestCase):
         with self.assertRaises(DecodeError):
             net._decompress(payload, "deflate", None)
 
+    def test_empty_raw_stream_is_accepted(self):
+        """合法的空 raw 流（2 字节）不是坏数据，按空响应处理。"""
+        engine = zlib.compressobj(9, zlib.DEFLATED, -15)
+        raw = engine.compress(b"") + engine.flush()
+        self.assertEqual(net._decompress(raw, "deflate", None), b"")
+
+    def test_raw_stream_with_trailing_data_is_rejected(self):
+        """raw 流带尾随字节正好是随机字节误判的形态；RFC1951 没有校验和可依。"""
+        engine = zlib.compressobj(9, zlib.DEFLATED, -15)
+        raw = engine.compress("公告".encode()) + engine.flush()
+        with self.assertRaises(DecodeError):
+            net._decompress(raw + b"x", "deflate", None)
+
     def test_corrupt_deflate_is_retried(self):
         """坏数据必须走 DecodeError 重试；以前 raw 回退会把它当成功（只请求 1 次）。"""
         payload = bytes.fromhex(
@@ -352,6 +365,14 @@ class TestPrivateRedirect(unittest.TestCase):
         """urlsplit 对畸形 IPv6 直接抛 ValueError，不能冒到 main 把整轮打挂。"""
         with self.assertRaises(FetchError):
             net.fetch("http://[::1/feed")
+
+    def test_malformed_redirect_url_is_rejected(self):
+        """重定向处理器是公共入口，畸形 Location 也要转成 HTTPError。"""
+        handler = net.SafeRedirectHandler()
+        request = urllib.request.Request("https://a.test/x")
+        with self.assertRaises(urllib.error.HTTPError):
+            handler.redirect_request(request, None, 302, "Found", {},
+                                     "http://[::1/feed")
 
 
 class TestBudgetAndRetryAfter(unittest.TestCase):

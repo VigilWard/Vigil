@@ -72,7 +72,10 @@ def _as_stamp(value, name: str) -> int:
     """
     stamp = _as_int(value, name)
     if not 0 <= stamp < MAX_TIMESTAMP:
-        raise StateError(f"{name} 超出合理范围（0 ≤ 值 < {MAX_TIMESTAMP}）：{value!r}")
+        raise StateError(
+            f"{name} 超出合理范围（0 ≤ 值 < {MAX_TIMESTAMP}）：{value!r}；"
+            "如果手工改过 state，请用 reset 模式重建基线"
+        )
     return stamp
 
 
