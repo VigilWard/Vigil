@@ -259,6 +259,34 @@ class TestAlertBookkeeping(StateCase):
         self.assertEqual(health.alert_sent, {"a": "fail"})
 
 
+class TestTimestampValidation(StateCase):
+    def _load(self, **sections):
+        raw = {"version": 2, "saved_at": 0, "heartbeat": 0,
+               "sources": {}, "seen": {}, "seen_at": {}, "pending": {}}
+        raw.update(sections)
+        self.path.write_text(json.dumps(raw), encoding="utf-8")
+        return load_state(self.path)
+
+    def test_huge_alert_at_is_rejected(self):
+        """超大 alert_at 会让 `now - alert_at` 恒为负，告警被永久静默。"""
+        with self.assertRaises(StateError):
+            self._load(sources={"s": {"alert_at": 10**30}})
+
+    def test_negative_timestamp_is_rejected(self):
+        with self.assertRaises(StateError):
+            self._load(sources={"s": {"last_ok": -1}})
+
+    def test_huge_seen_at_is_rejected(self):
+        """超大 seen_at 会绕过过期裁剪，seen 只增不减。"""
+        with self.assertRaises(StateError):
+            self._load(seen_at={"k": 10**30})
+
+    def test_normal_timestamps_load(self):
+        state = self._load(sources={"s": {"alert_at": 1793318400}},
+                           seen_at={"k": 1793318400})
+        self.assertEqual(state.health("s").alert_at, 1793318400)
+
+
 class TestRetention(StateCase):
     def test_old_seen_entries_are_pruned(self):
         state = State()

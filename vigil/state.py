@@ -18,6 +18,7 @@ from .models import (
     HEARTBEAT,
     MAX_PENDING,
     MAX_SEEN,
+    MAX_TIMESTAMP,
     PENDING_TTL,
     SEEN_REFRESH,
     SEEN_RETENTION,
@@ -61,6 +62,20 @@ def _as_int(value, name: str) -> int:
         raise StateError(f"{name} 超出可表示范围：{value!r}") from exc
 
 
+def _as_stamp(value, name: str) -> int:
+    """state 里的时间戳字段必须落在 [0, MAX_TIMESTAMP) 之内。
+
+    以前只做 int() 转换：`"alert_at": 10**30` 是合法 JSON 整数（不经过
+    `_reject_json_float`），加载后 `now - alert_at` 恒为负，告警会被永久
+    静默；`seen_at` 超上限则永远不参与过期裁剪。损坏的 state 必须停下来，
+    不能悄悄改变行为。
+    """
+    stamp = _as_int(value, name)
+    if not 0 <= stamp < MAX_TIMESTAMP:
+        raise StateError(f"{name} 超出合理范围（0 ≤ 值 < {MAX_TIMESTAMP}）：{value!r}")
+    return stamp
+
+
 @dataclass(slots=True)
 class SourceHealth:
     """单个源的健康状态。"""
@@ -97,9 +112,12 @@ class SourceHealth:
             if not isinstance(value, str):
                 raise StateError(f"state.sources.{field_name} 必须是字符串")
             setattr(health, field_name, sanitize_text(value))
-        for field_name in ("fail", "skipped", "empty", "last_ok", "alert_at"):
+        for field_name in ("fail", "skipped", "empty"):
             setattr(health, field_name,
                     _as_int(data.get(field_name, 0), f"state.sources.{field_name}"))
+        for field_name in ("last_ok", "alert_at"):
+            setattr(health, field_name,
+                    _as_stamp(data.get(field_name, 0), f"state.sources.{field_name}"))
         sent = data.get("alert_sent", {})
         if not isinstance(sent, dict) or not all(
             isinstance(key, str) and isinstance(value, str) for key, value in sent.items()
@@ -139,7 +157,7 @@ class Pending:
         return cls(
             item=data["item"],
             fingerprint=sanitize_text(str(data.get("fingerprint") or item.fingerprint)),
-            since=_as_int(data.get("since", 0), f"state.pending.{key}.since"),
+            since=_as_stamp(data.get("since", 0), f"state.pending.{key}.since"),
             sent=list(dict.fromkeys(sanitize_text(value) for value in sent)),
             seq=_as_int(data.get("seq", 0), f"state.pending.{key}.seq"),
         )
@@ -363,8 +381,8 @@ class State:
             )
 
         state = cls()
-        state.saved_at = _as_int(raw.get("saved_at", 0), "state.saved_at")
-        state.heartbeat = _as_int(raw.get("heartbeat", 0), "state.heartbeat")
+        state.saved_at = _as_stamp(raw.get("saved_at", 0), "state.saved_at")
+        state.heartbeat = _as_stamp(raw.get("heartbeat", 0), "state.heartbeat")
         sources = raw.get("sources", {})
         if not isinstance(sources, dict):
             raise StateError("state.sources 必须是对象")
@@ -387,7 +405,7 @@ class State:
             raise StateError("state.seen_at 必须是对象")
         state.seen_at = {}
         for key, value in seen_at.items():
-            state.seen_at[sanitize_text(str(key))] = _as_int(
+            state.seen_at[sanitize_text(str(key))] = _as_stamp(
                 value, f"state.seen_at.{key}"
             )
 

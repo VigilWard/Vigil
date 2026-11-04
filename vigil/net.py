@@ -322,8 +322,15 @@ def read_limited(stream, limit: int, deadline: float | None) -> bytes:
 
 
 def _inflate_limited(raw: bytes, deadline: float | None,
-                     wbits: int = zlib.MAX_WBITS) -> bytes:
-    """分块解压，解压后同样受 MAX_INFLATE 约束（deflate 炸弹防线）。"""
+                     wbits: int = zlib.MAX_WBITS,
+                     *, require_complete: bool = False) -> bytes:
+    """分块解压，解压后同样受 MAX_INFLATE 约束（deflate 炸弹防线）。
+
+    `require_complete` 给 raw deflate 兜底用：raw 流没有头和校验和，
+    随机字节里只要开头几个字节恰好构成一个合法块，就会"解压成功"并把
+    剩下的几十字节当成尾随数据丢掉。必须要求整段刚好解完且有输出。
+    （理论上仍无法与精心构造的合法 raw 流区分，但随机/损坏数据已被挡住。）
+    """
     engine = zlib.decompressobj(wbits)
     out: list[bytes] = []
     total = 0
@@ -349,6 +356,11 @@ def _inflate_limited(raw: bytes, deadline: float | None,
         # gzip 截断会抛 EOFError，deflate 不会：它只是安静地返回半截内容。
         # 不在这里判定，半截 XML/JSON 会被当成"解析失败"，重试也不会发生。
         raise DecodeError("deflate 流不完整（传输可能被截断）")
+    if require_complete and (engine.unused_data or not out):
+        # 随机/损坏字节被当成"合法的空块 + 一大段尾随数据"，这是 raw 回退
+        # 特有的误判。旧实现（只认 zlib 包装）会抛错并重试，不能在这里
+        # 悄悄返回垃圾。
+        raise DecodeError("deflate 流不完整或没有实际内容")
     return b"".join(out)
 
 
@@ -371,7 +383,8 @@ def _decompress(raw: bytes, encoding: str, deadline: float | None) -> bytes:
             # RFC 1951 原始流（没有 2 字节头）。只解包装格式会让这类源每轮
             # 都判失败，所以换 raw 窗口再试一次；仍然失败才是真的坏数据。
             try:
-                return _inflate_limited(raw, deadline, -zlib.MAX_WBITS)
+                return _inflate_limited(raw, deadline, -zlib.MAX_WBITS,
+                                        require_complete=True)
             except zlib.error as exc:
                 raise DecodeError(f"deflate 解压失败：{exc}") from exc
     # 不认识的值、以及 "gzip, deflate" 这类链式编码：以前直接 return raw，
@@ -437,16 +450,22 @@ def fetch(
     if last_modified:
         request_headers["If-Modified-Since"] = last_modified
     if headers:
-        request_headers.update(headers)
-        # 自定义头不能覆盖 Accept-Encoding：解压层只会 gzip，客户端要是声明
-        # br，服务器就真的返回 br，然后整源被判"不支持的编码"。这个头是
-        # 抓取器的实现细节，不该由源的 headers 配置决定。
-        request_headers["Accept-Encoding"] = "gzip"
+        for name, value in headers.items():
+            # HTTP 头名大小写不敏感：直接 update 会让 `accept-encoding` 与
+            # `Accept-Encoding` 同时存在，urllib 规范化后用户的值反而胜出，
+            # 服务端就会返回 br，整源被判"不支持的编码"。这个头由抓取器管。
+            if name.lower() == "accept-encoding":
+                continue
+            request_headers[name] = value
 
     # 初始地址也要过 SSRF 检查：以前只检查重定向，配置里写内网/元数据地址
     # 会被直接抓取并可能随消息外带。内网源用 VIGIL_ALLOW_PRIVATE_HOSTS=1 放行；
     # 云元数据/链路本地地址是唯一的例外，开了逃生门也不放行。
-    _, host, _ = _origin(url)
+    try:
+        _, host, _ = _origin(url)
+    except ValueError as exc:
+        # urlsplit 对畸形 IPv6 等输入直接抛 ValueError，不能让它冒到 main。
+        raise FetchError(f"地址无法解析：{url}") from exc
     if is_metadata_address(host):
         raise FetchError(f"拒绝访问云元数据或链路本地地址：{host or url}")
     if not allow_private_hosts() and is_blocked_host(host):

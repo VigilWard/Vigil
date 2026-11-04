@@ -180,7 +180,7 @@ class TestFile(unittest.TestCase):
 class TestPrivateHosts(ConfigCase):
     def test_private_address_is_rejected(self):
         for url in ("http://127.0.0.1/feed", "http://10.0.0.1/feed",
-                    "http://169.254.169.254/latest", "http://localhost/feed"):
+                    "http://localhost/feed"):
             with self.subTest(url=url):
                 with self.assertRaises(ConfigError) as ctx:
                     self._load({"sources": [{"name": "a", "url": url}]})
@@ -192,8 +192,9 @@ class TestPrivateHosts(ConfigCase):
         self.assertEqual(len(config.sources), 1)
 
     def test_metadata_addresses_stay_rejected_with_escape_hatch(self):
-        """逃生门是给内网源用的；元数据地址连它也不该放行（否则每轮白记一次失败）。"""
-        for url in ("http://instance-data/feed", "http://100.100.100.200/latest"):
+        """逃生门是给内网源用的；元数据地址连它也不该放行，提示不能误导。"""
+        for url in ("http://169.254.169.254/latest", "http://instance-data/feed",
+                    "http://100.100.100.200/latest"):
             with self.subTest(url=url), \
                     mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}):
                 self._rejects({"sources": [{"name": "a", "url": url}]}, "云元数据")

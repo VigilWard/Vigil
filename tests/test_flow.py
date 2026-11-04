@@ -148,6 +148,13 @@ class TestBasics(FlowCase):
             self.assertEqual(self.run_main("--dry-run"), 0)
         self.assertIn("没有需要推送的新条目", output.getvalue())
 
+    def test_dry_run_reports_skipped_sources(self):
+        """全被预算跳过时 items 为空，预览也必须说明"本轮未检查"。"""
+        with mock.patch("vigil.app.FETCH_BUDGET", 0), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.run_main("--dry-run"), 0)
+        self.assertIn("本轮未检查", output.getvalue())
+
     def test_dry_run_shows_items_stuck_in_queue(self):
         """上一轮没送达的条目，下一轮会跟着一起发，dry-run 必须体现出来。"""
         self.run_main()

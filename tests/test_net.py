@@ -189,19 +189,39 @@ class TestDeflateIntegrity(unittest.TestCase):
         raw = engine.compress(plain) + engine.flush()
         self.assertEqual(net._decompress(raw, "deflate", None), plain)
 
+    def test_raw_deflate_garbage_is_rejected(self):
+        """随机字节里可能恰好出现一个合法空块 + 一大段尾随数据，不能当成功。"""
+        payload = bytes.fromhex(
+            "b3035c49cd23480f2e6ec0d6e8ae50bd9fa62b1a4f5019298be2d9f8e2d48b6e")
+        with self.assertRaises(DecodeError):
+            net._decompress(payload, "deflate", None)
+
+    def test_corrupt_deflate_is_retried(self):
+        """坏数据必须走 DecodeError 重试；以前 raw 回退会把它当成功（只请求 1 次）。"""
+        payload = bytes.fromhex(
+            "b3035c49cd23480f2e6ec0d6e8ae50bd9fa62b1a4f5019298be2d9f8e2d48b6e")
+        response = FakeResponse(payload, {"Content-Encoding": "deflate"})
+        with mock.patch("vigil.net.open_url", return_value=response) as opener, \
+                mock.patch("time.sleep"), self.assertRaises(FetchError):
+            net.fetch("https://a.test/x")
+        self.assertEqual(opener.call_count, 3)
+
 
 class TestRequestHeaders(unittest.TestCase):
     def test_custom_headers_cannot_break_decompression(self):
-        """自定义头不能覆盖 Accept-Encoding：解压层只会 gzip。"""
-        seen = {}
+        """自定义头不能覆盖 Accept-Encoding：解压层只会 gzip，头名大小写不敏感。"""
+        for name in ("Accept-Encoding", "accept-encoding",
+                     "ACCEPT-ENCODING", "AcCePt-EnCoDiNg"):
+            seen: dict[str, str] = {}
 
-        def fake(request, timeout=None):
-            seen.update(request.headers)
-            raise FetchError("stop")
+            def fake(request, timeout=None, _seen=seen):
+                _seen.update(request.headers)
+                raise FetchError("stop")
 
-        with mock.patch("vigil.net.open_url", fake), self.assertRaises(FetchError):
-            net.fetch("https://a.test/x", headers={"Accept-Encoding": "br"})
-        self.assertEqual(seen.get("Accept-encoding"), "gzip")
+            with self.subTest(name=name), mock.patch("vigil.net.open_url", fake), \
+                    self.assertRaises(FetchError):
+                net.fetch("https://a.test/x", headers={name: "br"})
+            self.assertEqual(seen.get("Accept-encoding"), "gzip")
 
 
 class TestRetryAfterDate(unittest.TestCase):
@@ -327,6 +347,11 @@ class TestPrivateRedirect(unittest.TestCase):
                 self.assertRaises(FetchError):
             net.fetch("http://100.100.100.200/latest/meta-data/")
         opener.assert_not_called()
+
+    def test_malformed_ipv6_url_is_a_fetch_error(self):
+        """urlsplit 对畸形 IPv6 直接抛 ValueError，不能冒到 main 把整轮打挂。"""
+        with self.assertRaises(FetchError):
+            net.fetch("http://[::1/feed")
 
 
 class TestBudgetAndRetryAfter(unittest.TestCase):

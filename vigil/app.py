@@ -384,6 +384,10 @@ def cmd_dry_run(config: Config, state_path) -> int:
 
     for failure in report.failures:
         log(f"⚠ {failure.name}：{failure.detail}")
+    for skipped in report.skipped:
+        # 被预算跳过的源也要在预览里出现：全被跳过时 items 为空，
+        # 后面会提前 return，compose 的 notes 根本走不到。
+        log(f"⚠ {skipped.name}：本轮未检查（{skipped.detail}）")
 
     new_keys = {source.key for source in config.sources
                 if not state.health(source.key).initialized}
