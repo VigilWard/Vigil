@@ -131,6 +131,12 @@ class TestShorten(unittest.TestCase):
     def test_zero_budget(self):
         self.assertEqual(shorten_bytes("abc", 0), "")
 
+    def test_tiny_budget_keeps_a_character_instead_of_ellipsis(self):
+        """预算只够一个汉字时，不能把整段内容换成一个"…"。"""
+        self.assertEqual(shorten_bytes("中文" * 10, 4), "中")
+        self.assertEqual(shorten_bytes("中文" * 10, 5), "中")
+        self.assertEqual(shorten_bytes("中文" * 10, 6), "中…")
+
 
 class TestTime(unittest.TestCase):
     def test_rfc822(self):
@@ -146,6 +152,16 @@ class TestTime(unittest.TestCase):
         self.assertEqual(parse_time("2026-10-30T00:00:00Z"), expected)
         self.assertEqual(parse_time("2026-10-30"), expected)
         self.assertEqual(parse_time("2026-10-30T08:00:00+08:00"), expected)
+
+    def test_lowercase_z_is_utc(self):
+        """ISO 8601 允许小写 z；以前只把大写 Z 换成 +00:00，小写被当无日期。"""
+        expected = int(datetime(2026, 10, 30, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(parse_time("2026-10-30T00:00:00z"), expected)
+
+    def test_non_decimal_digits_are_not_timestamps(self):
+        """`²` 能通过 isdigit() 但 int() 会抛；全角数字会被 int() 当成 1973 年。"""
+        for value in ("²" * 9, "１２３４５６７８９"):
+            self.assertEqual(parse_time(value), 0, value)
 
     def test_epoch(self):
         self.assertEqual(parse_time(1793318400), 1793318400)

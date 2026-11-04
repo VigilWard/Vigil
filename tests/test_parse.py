@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from email.utils import format_datetime
 from unittest import mock
 
-from vigil.models import ParseError, Source
+from vigil.models import Item, ParseError, Source
 from vigil.parse import parse_json, parse_kev, parse_nginx, parse_rss
 
 SRC = Source("测试源", "https://example.test/feed.xml")
@@ -374,6 +374,33 @@ class TestStructureGuards(unittest.TestCase):
         html = '<ul><li><p>Severity: high<br>CVE-2026-1111'
         with self.assertRaises(ParseError):
             parse_nginx(html, Source("N", "https://nginx.org/x", kind="nginx"))
+
+
+class TestBadDate(unittest.TestCase):
+    def test_non_decimal_date_does_not_break_the_whole_feed(self):
+        """畸形的 pubDate（`²`）曾让 int() 抛到 collect，把整源判成解析器异常。"""
+        rss = ('<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>'
+               "<item><title>公告</title><guid>1</guid><pubDate>"
+               + "²" * 9 +
+               "</pubDate></item></channel></rss>")
+        items = parse_rss(rss, SRC)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].published, 0)
+
+
+class TestCap(unittest.TestCase):
+    def test_undated_items_survive_the_cap(self):
+        """截断时无日期条目按"最新"处理；2**31 在 2038 年后会被真实时间戳超过。"""
+        from vigil.parse import _cap
+
+        items = [
+            Item(source_key="s", source_name="s", uid="undated", title="无日期", published=0),
+            Item(source_key="s", source_name="s", uid="f1", title="2065", published=3_000_000_000),
+            Item(source_key="s", source_name="s", uid="f2", title="2066", published=3_100_000_000),
+        ]
+        with mock.patch("vigil.parse.MAX_NODES", 2):
+            kept = [item.uid for item in _cap(items)]
+        self.assertIn("undated", kept)
 
 
 if __name__ == "__main__":

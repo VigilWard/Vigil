@@ -182,6 +182,27 @@ class TestDeflateIntegrity(unittest.TestCase):
         raw = zlib.compress(b"abc") + b"garbage"
         self.assertEqual(net._decompress(raw, "deflate", None), b"abc")
 
+    def test_raw_deflate_is_accepted(self):
+        """RFC 1951 原始流（没有 zlib 头）也要能解；不少服务器这么发。"""
+        plain = "中文内容".encode()
+        engine = zlib.compressobj(9, zlib.DEFLATED, -15)
+        raw = engine.compress(plain) + engine.flush()
+        self.assertEqual(net._decompress(raw, "deflate", None), plain)
+
+
+class TestRequestHeaders(unittest.TestCase):
+    def test_custom_headers_cannot_break_decompression(self):
+        """自定义头不能覆盖 Accept-Encoding：解压层只会 gzip。"""
+        seen = {}
+
+        def fake(request, timeout=None):
+            seen.update(request.headers)
+            raise FetchError("stop")
+
+        with mock.patch("vigil.net.open_url", fake), self.assertRaises(FetchError):
+            net.fetch("https://a.test/x", headers={"Accept-Encoding": "br"})
+        self.assertEqual(seen.get("Accept-encoding"), "gzip")
+
 
 class TestRetryAfterDate(unittest.TestCase):
     def test_http_date_is_converted_to_seconds(self):
@@ -289,9 +310,22 @@ class TestPrivateRedirect(unittest.TestCase):
 
     def test_metadata_url_is_rejected_without_any_request(self):
         with mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}), \
-                mock.patch("vigil.net.open_url") as opener, \
+                mock.patch("vigil.net.open_url", side_effect=AssertionError("不应发出请求")) as opener, \
                 self.assertRaises(FetchError):
             net.fetch("http://169.254.169.254/latest/meta-data/")
+        opener.assert_not_called()
+
+    def test_cloud_metadata_ranges_are_covered(self):
+        """阿里云 100.100.100.200、AWS IPv6 fd00:ec2::254 都不是 link-local。"""
+        for host in ("100.100.100.200", "fd00:ec2::254",
+                     "::ffff:169.254.169.254", "::ffff:100.100.100.200"):
+            self.assertTrue(net.is_metadata_address(host), host)
+
+    def test_aliyun_metadata_is_blocked_even_with_escape_hatch(self):
+        with mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}), \
+                mock.patch("vigil.net.open_url", side_effect=AssertionError("不应发出请求")) as opener, \
+                self.assertRaises(FetchError):
+            net.fetch("http://100.100.100.200/latest/meta-data/")
         opener.assert_not_called()
 
 

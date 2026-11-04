@@ -127,7 +127,12 @@ def shorten_bytes(text: str, budget: int) -> str:
         return text
     if budget <= 3:
         return raw[:budget].decode("utf-8", "ignore")
-    return raw[: budget - 3].decode("utf-8", "ignore") + "…"
+    cut = raw[: budget - 3].decode("utf-8", "ignore")
+    if not cut:
+        # 预算连一个汉字都放不下（4~5 字节）：宁可不要省略号，
+        # 也不能把整段内容换成一个"…"。
+        return raw[:budget].decode("utf-8", "ignore")
+    return cut + "…"
 
 
 def _inline(text: str) -> str:
@@ -342,10 +347,11 @@ def compose(
 
     stamp = f"{datetime.fromtimestamp(now, CST):%m-%d %H:%M}"
     if not selected:
-        if not notes:
-            return []
-        # 只有源异常、没有条目时也发一条状态消息，别把提示吞掉
-        return [Message("Vigil · 源状态提示", stamp, "\n".join(notes))]
+        # 没有条目就什么都不发：源异常提示只在有内容时搭车（app._deliver 在
+        # 队列为空时直接返回，根本不会调到这里）。单独发"状态卡片"会让一个
+        # 抖动的源每 10 分钟刷一张空卡片——README 里明确不这么做。
+        # 旧版这里还会发一条 "Vigil · 源状态提示"，是已被推翻的设计残留。
+        return []
 
     total = len(selected)
     messages: list[Message] = []

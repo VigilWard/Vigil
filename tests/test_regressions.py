@@ -761,14 +761,12 @@ class TestSplitText(unittest.TestCase):
         self.assertEqual("".join(chunks), "A" * 5000)
 
 
-class TestStatusOnlyMessage(unittest.TestCase):
-    def test_status_only_message_is_not_dropped(self):
-        """只有"源异常提示"、没有条目时，提示也不能被静默丢掉。"""
+class TestFailureNotice(unittest.TestCase):
+    def test_failure_notice_without_items_is_not_sent(self):
+        """没有条目就不发卡片：源异常只在有内容时搭车，README 明确不单发空卡片。"""
         config = Config(sources=[Source("源A", "https://a.test/1")])
         messages = compose(config, [], NOW, failures=[Failure("坏源", "k", "HTTP 500")])
-        self.assertEqual(len(messages), 1)
-        self.assertEqual(messages[0].keys, [])
-        self.assertIn("抓取失败：坏源", messages[0].body)
+        self.assertEqual(messages, [])
 
     def test_failure_notice_rides_with_items(self):
         config = Config(sources=[Source("源A", "https://a.test/1")])
@@ -969,7 +967,8 @@ class TestSurrogateSafety(unittest.TestCase):
         raw = '[{"id":"1","title":"bad \\ud800 title","link":"https://e.test/1"}]'
         item = parse_json(raw, source)[0]
         self.assertNotIn("\ud800", item.title)
-        self.assertTrue(item.title.encode("utf-8"))
+        # 不能只断言"encode 不抛"：正常内容也要留下来，不能整条变成替换字符
+        self.assertIn("bad", item.title)
         self.assertTrue(item.fingerprint)
 
     def test_surrogate_survives_state_roundtrip_safely(self):

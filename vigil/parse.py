@@ -325,12 +325,17 @@ def parse_time(value) -> int:
     text = str(value).strip()
     if not text or text.lower() in ("null", "none", "n/a"):
         return 0
-    if text.isdigit():
+    # 只认 ASCII 十进制数字。`²`.isdigit() 也是 True，但 int('²²…') 会抛
+    # ValueError，冒到 collect 的兜底里会把整个源判成"解析器异常"；
+    # 全角 '１２３４５６７８９' 则会被 int() 成功转成 123456789（1973 年）。
+    if text.isascii() and text.isdigit():
         # 只有 9~13 位才当作 Unix 时间戳；8 位的 20261031 是日期，不能按 1970 年算
         if 9 <= len(text) <= 13:
             return parse_time(int(text))
     else:
-        normalized = text.replace("Z", "+00:00") if text.endswith(("Z", "z")) else text
+        # 只替换结尾那一个字符。str.replace("Z", …) 会把正文里偶然出现的
+        # 大写 Z 也一起换掉；而且要同时认小写 z（不少源这么写）。
+        normalized = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
         try:
             parsed = datetime.fromisoformat(normalized)
             if parsed.tzinfo is None:
@@ -518,7 +523,12 @@ def _cap(items: list[Item]) -> list[Item]:
     items = unique
     if len(items) <= MAX_NODES:
         return items
-    ranked = sorted(items, key=lambda item: item.published or 2**31, reverse=True)
+    # 无日期条目按"最新"处理：这里是在决定**丢谁**，把未知日期当成最旧会
+    # 直接把它们丢掉（NGINX 整类源都没有日期）。这和 pending_for 的"发送
+    # 顺序把无日期排最后"不冲突，那边是排序，这边是保命。
+    # 用 MAX_TIMESTAMP + 1 而不是 2**31：后者在 2038 年后会被真实时间戳超过，
+    # 排序会悄悄反过来。
+    ranked = sorted(items, key=lambda item: item.published or MAX_TIMESTAMP + 1, reverse=True)
     log(f"⚠ 条目过多（{len(items)} 条），只保留最新 {MAX_NODES} 条")
     return ranked[:MAX_NODES]
 

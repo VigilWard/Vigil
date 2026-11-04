@@ -7,7 +7,7 @@ import urllib.parse
 from unittest import mock
 
 from tests.support import FakeResponse
-from vigil.models import Item
+from vigil.models import FetchError, Item
 from vigil.translate import (
     MAX_REQUESTS,
     BaiduProvider,
@@ -157,6 +157,18 @@ class TestTranslate(unittest.TestCase):
         with mock.patch("vigil.net.open_url", side_effect=responder(google_body("译"))) as opener:
             Translator().translate([item])
         self.assertEqual(opener.call_count, 1)
+
+    def test_empty_translation_is_not_counted_as_done(self):
+        """翻译源返回空串时不能算"翻好"：日志里的条数会虚报。"""
+        with mock.patch("vigil.net.open_url", side_effect=responder(google_body(""))):
+            self.assertEqual(Translator().translate(make_items(1)), 0)
+
+    def test_metadata_endpoint_is_rejected(self):
+        """TRANSLATE_ENDPOINT 可被覆盖：标题和摘要不能被打包发往云元数据。"""
+        with mock.patch("vigil.net.open_url", side_effect=AssertionError("不应发出请求")) as opener, \
+                self.assertRaises(FetchError):
+            GoogleProvider("http://169.254.169.254/x")._fetch("http://169.254.169.254/x", None)
+        opener.assert_not_called()
 
 
 class TestBuild(unittest.TestCase):

@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 
 from . import net
-from .models import MAX_RESPONSE, BudgetExceeded, Item, log
+from .models import MAX_RESPONSE, BudgetExceeded, FetchError, Item, log
 
 DEFAULT_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
 MYMEMORY_ENDPOINT = "https://api.mymemory.translated.net/get"
@@ -138,6 +138,11 @@ class Provider:
 
     def _fetch(self, url: str, deadline: float | None,
                data: bytes | None = None) -> str:
+        # TRANSLATE_ENDPOINT 可以被环境变量覆盖（镜像/代理）。这里做纵深防御：
+        # 配置或密钥出问题时，标题和摘要不能被打包发到云元数据接口去。
+        host = urllib.parse.urlsplit(url).hostname or ""
+        if net.is_metadata_address(host):
+            raise FetchError(f"拒绝把翻译请求发往云元数据地址：{host or url}")
         headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
@@ -290,10 +295,13 @@ class Translator:
             if self.failures >= FAILURE_LIMIT:
                 break
             try:
+                produced = False
                 if not item.title_zh:
                     item.title_zh = self.translate_text(item.title)
+                    produced = bool(item.title_zh)
                 if item.summary and not item.summary_zh:
                     item.summary_zh = self.translate_text(item.summary)
+                    produced = produced or bool(item.summary_zh)
             except BudgetExceeded:
                 log("⚠ 翻译超出本轮时间预算，停止翻译（条目会用原文发出）")
                 break
@@ -303,7 +311,10 @@ class Translator:
                 if self.failures >= FAILURE_LIMIT:
                     log("⚠ 所有翻译源都不可用，本轮不再尝试（条目会用英文原文发出）")
                 continue
-            done += 1
+            # 翻译源返回空串（或条目本来就有译文）时不算"翻好"：
+            # 以前无条件 +1，日志里的"已翻译 N 条"会虚报。
+            if produced:
+                done += 1
         return done
 
 

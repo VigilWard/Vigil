@@ -28,7 +28,8 @@ from .render import Message
 # 飞书在限流时返回 HTTP 200 + 业务码：9499（通用）和 11232（自定义机器人最常遇到，
 # 单机器人 100 次/分钟、5 次/秒）。两者都属于可重试，不能当成永久错误。
 RATE_LIMIT_CODES = frozenset({9499, 11232})
-# 刻意与抓取重试解耦：推送和抓取面对的是完全不同的服务，调一个不该影响另一个
+# 重试次数单独设置：推送和抓取面对的是不同服务，改推送次数不该影响抓取。
+# 退避节奏仍与抓取共用 RETRY_BACKOFF / RETRY_MAX_WAIT / RETRY_STATUS。
 PUSH_ATTEMPTS = 3
 
 

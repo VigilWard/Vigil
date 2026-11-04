@@ -103,6 +103,16 @@ def is_blocked_host(host: str) -> bool:
     return not address.is_global
 
 
+# 云厂商元数据地址：链路本地（含 169.254.169.254）+ 阿里云 100.100.100.200
+# + AWS IPv6 fd00:ec2::254。都不是可路由的公网地址，也没有正常订阅源。
+_METADATA_NETWORKS = (
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("100.100.100.200/32"),
+    ipaddress.ip_network("fd00:ec2::254/128"),
+)
+
+
 def is_metadata_address(host: str) -> bool:
     """云元数据服务与链路本地地址。
 
@@ -113,7 +123,10 @@ def is_metadata_address(host: str) -> bool:
     if not host:
         # 空主机名交给 is_blocked_host 处理，别在这里冒充"元数据地址"
         return False
-    if host in {"metadata.google.internal", "metadata.goog", "instance-data"}:
+    if host in {
+        "metadata.google.internal", "metadata.goog", "instance-data",
+        "instance-data.ec2.internal", "metadata.tencentyun.com",
+    }:
         return True
     try:
         address = ipaddress.ip_address(host)
@@ -122,8 +135,11 @@ def is_metadata_address(host: str) -> bool:
             address = ipaddress.ip_address(socket.inet_aton(host))
         except (OSError, UnicodeError):
             return False
-    # 169.254.0.0/16（含 169.254.169.254）与 fe80::/10 都算链路本地
-    return address.is_link_local
+    # `http://[::ffff:169.254.169.254]/` 和裸 IPv4 是同一个目标，但版本不同，
+    # 直接比网段会漏掉；先拆出内嵌的 IPv4。
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return any(address in network for network in _METADATA_NETWORKS)
 
 
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -305,9 +321,10 @@ def read_limited(stream, limit: int, deadline: float | None) -> bytes:
     return b"".join(chunks)
 
 
-def _inflate_limited(raw: bytes, deadline: float | None) -> bytes:
+def _inflate_limited(raw: bytes, deadline: float | None,
+                     wbits: int = zlib.MAX_WBITS) -> bytes:
     """分块解压，解压后同样受 MAX_INFLATE 约束（deflate 炸弹防线）。"""
-    engine = zlib.decompressobj(zlib.MAX_WBITS)
+    engine = zlib.decompressobj(wbits)
     out: list[bytes] = []
     total = 0
     pending = raw
@@ -349,8 +366,14 @@ def _decompress(raw: bytes, encoding: str, deadline: float | None) -> bytes:
     if encoding == "deflate":
         try:
             return _inflate_limited(raw, deadline)
-        except zlib.error as exc:
-            raise DecodeError(f"deflate 解压失败：{exc}") from exc
+        except zlib.error:
+            # RFC 9110 的 "deflate" 名义上是 zlib 包装，但不少服务器直接发
+            # RFC 1951 原始流（没有 2 字节头）。只解包装格式会让这类源每轮
+            # 都判失败，所以换 raw 窗口再试一次；仍然失败才是真的坏数据。
+            try:
+                return _inflate_limited(raw, deadline, -zlib.MAX_WBITS)
+            except zlib.error as exc:
+                raise DecodeError(f"deflate 解压失败：{exc}") from exc
     # 不认识的值、以及 "gzip, deflate" 这类链式编码：以前直接 return raw，
     # 压缩字节被当正文解码成乱码，再记成"源失败"，重试也不会好。
     # 明确报错，日志里能一眼看出是编码不支持，而不是源站挂了。
@@ -415,6 +438,10 @@ def fetch(
         request_headers["If-Modified-Since"] = last_modified
     if headers:
         request_headers.update(headers)
+        # 自定义头不能覆盖 Accept-Encoding：解压层只会 gzip，客户端要是声明
+        # br，服务器就真的返回 br，然后整源被判"不支持的编码"。这个头是
+        # 抓取器的实现细节，不该由源的 headers 配置决定。
+        request_headers["Accept-Encoding"] = "gzip"
 
     # 初始地址也要过 SSRF 检查：以前只检查重定向，配置里写内网/元数据地址
     # 会被直接抓取并可能随消息外带。内网源用 VIGIL_ALLOW_PRIVATE_HOSTS=1 放行；

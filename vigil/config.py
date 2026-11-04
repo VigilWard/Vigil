@@ -21,7 +21,7 @@ from .models import (
     Source,
     sanitize_text,
 )
-from .net import allow_private_hosts, is_blocked_host
+from .net import allow_private_hosts, is_blocked_host, is_metadata_address
 from .parse import PARSERS
 
 ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -107,6 +107,10 @@ def _check_url(url: str, where: str) -> None:
             f"{where}的 url 指向本机或私网地址，已拒绝；"
             "如果确实要抓内网源，请设置 VIGIL_ALLOW_PRIVATE_HOSTS=1"
         )
+    # 元数据地址连逃生门也不放行，和 fetch 的判定保持一致：否则配置阶段放行、
+    # 抓取阶段拒绝，每轮白记一次"源失败"（instance-data 就是这种主机名）。
+    if is_metadata_address(parts.hostname):
+        raise ConfigError(f"{where}的 url 指向云元数据或链路本地地址，已拒绝")
 
 
 def _check_headers(headers: dict[str, str], where: str) -> dict[str, str]:

@@ -330,14 +330,6 @@ class TestCompose(unittest.TestCase):
         self.assertIn("未检查：慢源", messages[0].body)
         self.assertNotIn("抓取失败", messages[1].body)
 
-    def test_status_only_message_when_no_items(self):
-        messages = compose(self.config, [], 1793000000,
-                           failures=[Failure("坏源", "k", "x")])
-        self.assertEqual(len(messages), 1)
-        self.assertIn("源状态提示", messages[0].title)
-        self.assertIn("抓取失败：坏源", messages[0].body)
-        self.assertEqual(messages[0].keys, [])
-
     def test_empty_items(self):
         self.assertEqual(compose(self.config, [], 1793000000), [])
 

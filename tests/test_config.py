@@ -191,6 +191,13 @@ class TestPrivateHosts(ConfigCase):
             config = self._load({"sources": [{"name": "a", "url": "http://127.0.0.1/feed"}]})
         self.assertEqual(len(config.sources), 1)
 
+    def test_metadata_addresses_stay_rejected_with_escape_hatch(self):
+        """逃生门是给内网源用的；元数据地址连它也不该放行（否则每轮白记一次失败）。"""
+        for url in ("http://instance-data/feed", "http://100.100.100.200/latest"):
+            with self.subTest(url=url), \
+                    mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}):
+                self._rejects({"sources": [{"name": "a", "url": url}]}, "云元数据")
+
 
 class TestJsonMappingValidation(ConfigCase):
     def test_empty_mapping_value_is_rejected(self):
