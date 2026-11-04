@@ -14,6 +14,7 @@ from .config import load_config
 from .feishu import card_of, send, send_card
 from .models import (
     ALERT_REPEAT,
+    ALERT_SWITCH_GAP,
     CONFIG_FILE,
     EMPTY_ALERT,
     FAIL_ALERT,
@@ -164,11 +165,16 @@ def build_alerts(
                                     f"✅ {source.name} 已恢复正常。", stale & targets))
             continue
 
-        # 换了故障类型立刻发；同一种故障按 ALERT_REPEAT 节流；
-        # 另外只要还有目标没收到过这一条，也要补发（多群场景）。
+        # 换了故障类型通常立刻发（empty → fail 是升级）；同一种故障按
+        # ALERT_REPEAT 节流；另外只要还有目标没收到过这一条，也要补发（多群场景）。
+        # 但"类型一变就发"会被反复横跳的源利用来绕过 6 小时节流，所以类型
+        # 切换本身也受 ALERT_SWITCH_GAP 约束。health.alert 为空表示当前目标
+        # 都没收到过（新源、或记账刚被 prune_alerts 清掉），这种情况立刻发。
         # "返回空内容"是稳态，只提醒一次，等恢复时再通知。
         repeatable = kind in ("fail", "skip")
         if health.alert != kind:
+            if health.alert and now - health.alert_at < ALERT_SWITCH_GAP:
+                continue
             need = set(targets)
         else:
             need = {tid for tid in targets if health.alert_sent.get(tid) != kind}
@@ -278,12 +284,17 @@ def _deliver(
         return False
 
     target_ids = {target.tid for target in targets}
+    # 删掉的目标也要把告警记账一起收尾：alert_sent 只在"已恢复"时按目标 pop，
+    # 目标从配置里消失后它的记录永远 pop 不掉，health.alert 会永久粘住；
+    # 而且这个目标以后加回来，会立刻收到一条它从没收到过对应告警的"已恢复正常"。
+    pruned = state.prune_alerts(target_ids)
     # 目标集合可能比上一轮小了（删掉某个群）。已经满足当前集合的记录不会再被
     # 任何 target 选中，不在这里转正就只能等 7 天 TTL，白占队列。
     # 转正后必须立刻落盘：这支分支不会再发消息，也就没有别的地方会 save。
     retired = state.retire(target_ids, now)
-    if retired:
+    if retired or pruned:
         state.save(state_path)
+    if retired:
         # 转正意味着"不再补发"，删错配置时这行日志是唯一的线索
         log(f"   目标集合变小：{retired} 条待送达记录已转正（不会再补发）")
     if not state.pending:

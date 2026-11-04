@@ -119,6 +119,9 @@ class Pending:
     fingerprint: str
     since: int
     sent: list[str]
+    # 入队序号。state.json 是按 key 排序写的，没有它，无日期条目（NGINX）
+    # 重新加载后就变成"按哈希随机"的顺序，和入队顺序无关了。
+    seq: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -138,6 +141,7 @@ class Pending:
             fingerprint=sanitize_text(str(data.get("fingerprint") or item.fingerprint)),
             since=_as_int(data.get("since", 0), f"state.pending.{key}.since"),
             sent=list(dict.fromkeys(sanitize_text(value) for value in sent)),
+            seq=_as_int(data.get("seq", 0), f"state.pending.{key}.seq"),
         )
 
 
@@ -150,6 +154,7 @@ class State:
         self.saved_at: int = 0
         self.heartbeat: int = 0
         self._pruned = False
+        self._seq = 0
 
     # ------------------------------------------------------------ 健康状态
     def health(self, key: str) -> SourceHealth:
@@ -187,11 +192,13 @@ class State:
         existing = self.pending.get(item.key)
         if existing and existing.fingerprint == item.fingerprint:
             return False
+        self._seq += 1
         self.pending[item.key] = Pending(
             item=item.to_dict(),
             fingerprint=item.fingerprint,
             since=now,
             sent=[],
+            seq=self._seq,
         )
         return True
 
@@ -215,15 +222,41 @@ class State:
         return items
 
     def pending_for(self, target_id: str) -> list[Item]:
-        items = []
+        pairs: list[tuple[int, Item]] = []
         for record in self.pending.values():
             if target_id in record.sent:
                 continue
-            items.append(Item.from_dict(record.item))
-        # 新的在前；无日期（published=0）的条目保持入队顺序——稳定排序即可，
-        # 不要再按 key 排，那个是哈希值，等于把"谁先发"交给随机字符串。
-        items.sort(key=lambda item: -item.published)
-        return items
+            pairs.append((record.seq, Item.from_dict(record.item)))
+        # 新的在前；无日期（published=0）的条目按入队序，稳定排序即可。
+        # 入队序必须用 state 里存的 seq，不能用字典序——state.json 是按键
+        # 排序写的，重新加载后字典序就是哈希序，等于把"谁先发"交给随机字符串。
+        pairs.sort(key=lambda pair: (-pair[1].published, pair[0]))
+        return [item for _, item in pairs]
+
+    def prune_alerts(self, target_ids: set[str]) -> int:
+        """丢掉已从配置里删掉的目标的告警记账，返回清掉的条数。
+
+        `alert_sent` 只在收到"已恢复正常"时按目标 pop。目标被从 webhook
+        列表里删掉后，它的记录永远不会再被 pop：`health.alert` 会永久粘在
+        上一次故障类型上；更糟的是这个目标以后加回来，会立刻收到一条
+        "已恢复正常"——而它从来没收到过对应的告警。
+        """
+        if not target_ids:
+            # 目标列表整个为空通常是配置没读进来，不能把记账全清掉
+            return 0
+        dropped = 0
+        for health in self.sources.values():
+            gone = [tid for tid in health.alert_sent if tid not in target_ids]
+            if not gone:
+                continue
+            for tid in gone:
+                health.alert_sent.pop(tid, None)
+            dropped += len(gone)
+            if not health.alert_sent:
+                # 当前目标一个都没收到过这条告警：下一次要重新按类型发
+                health.alert = ""
+                health.alert_at = 0
+        return dropped
 
     def retire(self, target_ids: set[str], now: int) -> int:
         """把"当前目标集合已经全部收到"的记录转正，返回转正条数。
@@ -365,6 +398,8 @@ class State:
             sanitize_text(str(key)): Pending.from_dict(sanitize_text(str(key)), value)
             for key, value in pending.items()
         }
+        # 接着已有序号往下发，不能从 0 重新开始：重排后新旧记录会交错
+        state._seq = max((record.seq for record in state.pending.values()), default=0)
         return state
 
     # ------------------------------------------------------------ 读写

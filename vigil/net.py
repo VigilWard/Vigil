@@ -103,6 +103,29 @@ def is_blocked_host(host: str) -> bool:
     return not address.is_global
 
 
+def is_metadata_address(host: str) -> bool:
+    """云元数据服务与链路本地地址。
+
+    这类地址上没有任何正常的订阅源，所以**不受** `VIGIL_ALLOW_PRIVATE_HOSTS`
+    影响：内网源配了开放跳转、或本身被攻破时，它就是云凭据泄露的入口。
+    """
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        # 空主机名交给 is_blocked_host 处理，别在这里冒充"元数据地址"
+        return False
+    if host in {"metadata.google.internal", "metadata.goog", "instance-data"}:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            address = ipaddress.ip_address(socket.inet_aton(host))
+        except (OSError, UnicodeError):
+            return False
+    # 169.254.0.0/16（含 169.254.169.254）与 fe80::/10 都算链路本地
+    return address.is_link_local
+
+
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     """阻止 HTTPS 降级；跨主机跳转时丢掉自定义请求头（可能含 token）。
 
@@ -124,6 +147,12 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         if new_origin[0] not in ("http", "https") or not new_origin[1]:
             raise urllib.error.HTTPError(
                 newurl, code, "拒绝重定向到非 HTTP(S) 地址", headers, fp
+            )
+        # 云元数据 / 链路本地：连"内网源 + 逃生门"也不放行。
+        # 没有任何正常订阅源住在那里，放行只会给凭据泄露留一条路。
+        if is_metadata_address(new_origin[1]):
+            raise urllib.error.HTTPError(
+                newurl, code, "拒绝重定向到云元数据或链路本地地址", headers, fp
             )
         # 跳到私网：只有"起点本来就在私网"且用户显式开了逃生门才放行。
         # 公网源 → 私网一律拦（这才是 SSRF 面）；内网源 → 内网是正常运维
@@ -388,11 +417,13 @@ def fetch(
         request_headers.update(headers)
 
     # 初始地址也要过 SSRF 检查：以前只检查重定向，配置里写内网/元数据地址
-    # 会被直接抓取并可能随消息外带。内网源用 VIGIL_ALLOW_PRIVATE_HOSTS=1 放行。
-    if not allow_private_hosts():
-        _, host, _ = _origin(url)
-        if is_blocked_host(host):
-            raise FetchError(f"拒绝访问本机或私网地址：{host or url}")
+    # 会被直接抓取并可能随消息外带。内网源用 VIGIL_ALLOW_PRIVATE_HOSTS=1 放行；
+    # 云元数据/链路本地地址是唯一的例外，开了逃生门也不放行。
+    _, host, _ = _origin(url)
+    if is_metadata_address(host):
+        raise FetchError(f"拒绝访问云元数据或链路本地地址：{host or url}")
+    if not allow_private_hosts() and is_blocked_host(host):
+        raise FetchError(f"拒绝访问本机或私网地址：{host or url}")
 
     last_error = "未知错误"
     attempts = 0

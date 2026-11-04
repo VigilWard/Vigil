@@ -210,6 +210,54 @@ class TestPendingOrder(StateCase):
                              title=uid, published=0), 100)
         self.assertEqual([item.uid for item in state.pending_for("t")], ["z", "a", "m"])
 
+    def test_order_survives_save_and_load(self):
+        """state.json 按键排序写盘；入队序必须存在记录里，不能靠字典序。"""
+        state = State()
+        now = int(time.time())
+        for uid in ("z", "a", "m"):
+            state.queue(Item(source_key="s", source_name="源", uid=uid,
+                             title=uid, published=0), now)
+        state.save(self.path)
+
+        loaded = load_state(self.path)
+        self.assertEqual([item.uid for item in loaded.pending_for("t")], ["z", "a", "m"])
+
+
+class TestAlertBookkeeping(StateCase):
+    def test_removed_target_is_dropped(self):
+        state = State()
+        health = state.health("s")
+        health.alert = "fail"
+        health.alert_at = 100
+        health.alert_sent = {"a": "fail", "b": "fail"}
+
+        self.assertEqual(state.prune_alerts({"a"}), 1)
+        self.assertEqual(health.alert_sent, {"a": "fail"})
+        # 还有目标收到过：当前告警仍然有效，不能重发
+        self.assertEqual((health.alert, health.alert_at), ("fail", 100))
+
+    def test_all_targets_gone_resets_alert(self):
+        """当前目标一个都没收到过，就不该再认为"已经通知过了"。"""
+        state = State()
+        health = state.health("s")
+        health.alert = "fail"
+        health.alert_at = 100
+        health.alert_sent = {"a": "fail", "b": "fail"}
+
+        self.assertEqual(state.prune_alerts({"c"}), 2)
+        self.assertEqual(health.alert_sent, {})
+        self.assertEqual((health.alert, health.alert_at), ("", 0))
+
+    def test_empty_target_set_is_a_noop(self):
+        """没配 webhook 时不能把记账全清掉，否则配上之后会重发一遍。"""
+        state = State()
+        health = state.health("s")
+        health.alert = "fail"
+        health.alert_sent = {"a": "fail"}
+
+        self.assertEqual(state.prune_alerts(set()), 0)
+        self.assertEqual(health.alert_sent, {"a": "fail"})
+
 
 class TestRetention(StateCase):
     def test_old_seen_entries_are_pruned(self):

@@ -39,6 +39,7 @@ class FlowCase(unittest.TestCase):
         self.mode = "ok"
         self.feed = build_rss([("g1", "旧条目", "d1")])
         self.posts = []
+        self.sent = []
         self.fail_for = set()
 
         self.webhook = "https://hook.test/a"
@@ -79,6 +80,7 @@ class FlowCase(unittest.TestCase):
         if target.webhook in self.fail_for:
             raise PushError("模拟推送失败")
         self.posts.append(text)
+        self.sent.append((target.webhook, text))
 
     @staticmethod
     def _card_text(card) -> str:
@@ -101,6 +103,13 @@ class FlowCase(unittest.TestCase):
 
     def state(self):
         return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def age_alert(self, seconds: int) -> None:
+        """把上次告警时间往前挪，模拟"已经过了这么久"（测试在同一秒内跑完）。"""
+        raw = self.state()
+        for record in raw.get("sources", {}).values():
+            record["alert_at"] = max(0, record.get("alert_at", 0) - seconds)
+        self.state_path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
 
 
 class TestBasics(FlowCase):
@@ -347,8 +356,71 @@ class TestAlertTruthfulness(FlowCase):
 
         self.run_main()
         self.run_main()                      # 第 3 轮空才是"结构可能变了"
+        # 故障类型切换有 1 小时的最小间隔（防止 fail↔empty 来回横跳绕过 6 小时
+        # 节流）。测试里的 6 轮是同一秒跑完的，这里显式把上次告警时间往前挪，
+        # 模拟线上"每轮 10 分钟、间隔已过"之后的下一轮。
+        self.age_alert(2 * 3600)
+        self.run_main()
         self.assertEqual(len(self.posts), 2)
         self.assertIn("返回空内容", self.posts[-1])
+
+    def test_kind_flip_does_not_resend_immediately(self):
+        """fail → empty 的类型切换有 1 小时间隔：否则横跳一次刷一条，绕过 6 小时节流。"""
+        self.run_main()
+        self.mode = "fail"
+        for _ in range(3):
+            self.run_main()
+        self.assertEqual(len(self.posts), 1)
+
+        self.mode = "ok"
+        self.feed = EMPTY_FEED
+        for _ in range(4):
+            self.run_main()                  # empty 已到 3 轮，但离上次告警不足 1 小时
+        self.assertEqual(len(self.posts), 1)
+
+        self.age_alert(3600)
+        self.run_main()
+        self.assertEqual(len(self.posts), 2)
+        self.assertIn("返回空内容", self.posts[-1])
+
+    def test_removed_target_does_not_get_a_false_recovery(self):
+        """删掉的目标不能留下告警记账：否则它加回来会立刻收到"已恢复正常"。"""
+        second = "https://hook.test/b"
+
+        def texts_to(webhook):
+            return [text for target, text in self.sent if target == webhook]
+
+        with mock.patch.dict(os.environ, {
+            "FEISHU_WEBHOOK": "",
+            "FEISHU_WEBHOOKS": json.dumps([self.webhook, second]),
+        }):
+            self.run_main()
+            self.mode = "fail"
+            for _ in range(3):
+                self.run_main()
+            self.assertEqual(len(texts_to(second)), 1)
+
+            # 删掉 B 的同时源恢复：恢复通知只该发给还在配置里的 A
+            with mock.patch.dict(os.environ, {
+                "FEISHU_WEBHOOK": self.webhook,
+                "FEISHU_WEBHOOKS": "",
+            }):
+                self.mode = "ok"
+                self.assertEqual(self.run_main(), 0)
+
+        # 记账也要一起清掉：否则 B 加回来会立刻收到一条假的"已恢复正常"
+        gone_tid = PushTarget(second, "").tid
+        self.assertNotIn(gone_tid, next(iter(self.state()["sources"].values()))["alert_sent"])
+
+        # 把 B 加回来：它从没收到过这次故障的告警，不该收到"已恢复正常"
+        with mock.patch.dict(os.environ, {
+            "FEISHU_WEBHOOK": "",
+            "FEISHU_WEBHOOKS": json.dumps([self.webhook, second]),
+        }):
+            self.assertEqual(self.run_main(), 0)
+        self.assertTrue(texts_to(self.webhook))
+        self.assertEqual(len(texts_to(second)), 1)
+        self.assertFalse(any("已恢复正常" in text for text in texts_to(second)))
 
     def test_new_source_that_never_returns_items_alerts(self):
         """新源一上来就是空：既建不了基线，也不能永远静默（以前 0 告警）。"""
@@ -453,10 +525,7 @@ class TestAlertDelivery(FlowCase):
             self.run_main()
         self.assertEqual(len(self.posts), 1)
 
-        raw = self.state()
-        for record in raw["sources"].values():
-            record["alert_at"] -= 7 * 3600
-        self.state_path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        self.age_alert(7 * 3600)
 
         self.run_main()
         self.assertEqual(len(self.posts), 2)

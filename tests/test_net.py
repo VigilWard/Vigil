@@ -278,6 +278,22 @@ class TestPrivateRedirect(unittest.TestCase):
                 self.assertRaises(urllib.error.HTTPError):
             handler.redirect_request(request, None, 302, "Found", {}, "https://10.0.0.1/feed")
 
+    def test_metadata_redirect_blocked_even_for_private_source(self):
+        """开逃生门是为了抓内网源，不是为了让人读云元数据。"""
+        handler = net.SafeRedirectHandler()
+        request = urllib.request.Request("http://10.0.0.1/feed")
+        with mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}), \
+                self.assertRaises(urllib.error.HTTPError):
+            handler.redirect_request(request, None, 302, "Found", {},
+                                     "http://169.254.169.254/latest/meta-data/")
+
+    def test_metadata_url_is_rejected_without_any_request(self):
+        with mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}), \
+                mock.patch("vigil.net.open_url") as opener, \
+                self.assertRaises(FetchError):
+            net.fetch("http://169.254.169.254/latest/meta-data/")
+        opener.assert_not_called()
+
 
 class TestBudgetAndRetryAfter(unittest.TestCase):
     def test_read_limited_respects_deadline(self):
