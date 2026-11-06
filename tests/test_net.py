@@ -182,6 +182,16 @@ class TestDeflateIntegrity(unittest.TestCase):
         raw = zlib.compress(b"abc") + b"garbage"
         self.assertEqual(net._decompress(raw, "deflate", None), b"abc")
 
+    def test_large_stream_with_trailing_data_does_not_hang(self):
+        """回归：解压后超过 64 KiB 且带尾随字节时，旧循环会在 eof 后空转。
+
+        触发条件是「max_length 截断 + 尾随数据」同时出现：1 KiB 的载荷测不出来。
+        带 deadline 跑，万一回归是失败而不是把测试挂死。
+        """
+        raw = zlib.compress(b"A" * 200000) + b"\r\n"
+        out = net._decompress(raw, "deflate", time.monotonic() + 2.0)
+        self.assertEqual(len(out), 200000)
+
     def test_raw_deflate_is_accepted(self):
         """RFC 1951 原始流（没有 zlib 头）也要能解；不少服务器这么发。"""
         plain = "中文内容".encode()
@@ -318,6 +328,36 @@ class TestPrivateRedirect(unittest.TestCase):
                 self.assertRaises(urllib.error.HTTPError):
             handler.redirect_request(request, None, 302, "Found", {},
                                      "http://169.254.169.254/")
+
+    def test_redirect_to_hostname_resolving_private_is_blocked(self):
+        """公网域名解析到内网（nip.io 这类）也要拦：字面检查看不出来。"""
+        handler = net.SafeRedirectHandler()
+        request = urllib.request.Request("https://a.test/x")
+        with mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": ""}), \
+                mock.patch("vigil.net.socket.getaddrinfo",
+                           return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]), \
+                self.assertRaises(urllib.error.HTTPError) as ctx:
+            handler.redirect_request(request, None, 302, "Found", {},
+                                     "https://feed.example.com/rss")
+        self.assertIn("解析", str(ctx.exception))
+
+    def test_redirect_to_public_hostname_is_allowed(self):
+        handler = net.SafeRedirectHandler()
+        request = urllib.request.Request("https://a.test/x")
+        with mock.patch("vigil.net.socket.getaddrinfo",
+                        return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]):
+            new = handler.redirect_request(request, None, 302, "Found", {},
+                                           "https://feed.example.com/rss")
+        self.assertIsNotNone(new)
+
+    def test_dns_failure_does_not_block_redirect(self):
+        """DNS 查询失败按"不拦截"处理：真连不上时请求自己会失败。"""
+        handler = net.SafeRedirectHandler()
+        request = urllib.request.Request("https://a.test/x")
+        with mock.patch("vigil.net.socket.getaddrinfo", side_effect=OSError("dns down")):
+            new = handler.redirect_request(request, None, 302, "Found", {},
+                                           "https://feed.example.com/rss")
+        self.assertIsNotNone(new)
 
     def test_redirect_with_invalid_port_is_rejected(self):
         handler = net.SafeRedirectHandler()

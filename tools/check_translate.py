@@ -7,7 +7,8 @@
 
 退出码：0 = 至少一个源可用；1 = 全部不可用。
 
-走的是 vigil.translate 的真实代码路径，所以这里的结论就等于线上的行为。
+走的是 vigil.translate 的真实 provider 实现；超长文本按线上单次上限截断后探测
+（线上是分段翻译，这里只验证链路通不通）。
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from vigil.translate import build_translator  # noqa: E402
+from vigil.translate import MAX_CHARS, build_translator  # noqa: E402
 
 # 样例里故意带上 CVE 编号，顺便验证翻译会不会把它弄丢
 SAMPLE = ("CVE-2026-11111: Ivanti Connect Secure Authentication Bypass Vulnerability. "
@@ -53,6 +54,11 @@ def classify(exc: Exception) -> str:
     if isinstance(exc, TimeoutError):
         return "timeout"
     if isinstance(exc, ValueError):
+        # MyMemory 的超长文本是 HTTP 200 + responseStatus 403，不是 HTTPError，
+        # 以前一律归成"返回格式变了"，会让人去查没坏的接口。
+        reason = str(exc).upper()
+        if "QUERY LENGTH" in reason or "STATUS=403" in reason:
+            return "403"
         return "shape"
     return "blocked"
 
@@ -63,6 +69,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     text = " ".join(args.text) if args.text else SAMPLE
+    # 线上会先按 MAX_CHARS 拆段再发；这里只探链路通不通，超长文本直接截断，
+    # 否则 MyMemory 会报 "QUERY LENGTH LIMIT EXCEEDED"，看起来像接口坏了。
+    if len(text) > MAX_CHARS:
+        print(f"（探测文本 {len(text)} 字符，超过单次上限 {MAX_CHARS}，已截断；线上是分段翻译）\n")
+        text = text[:MAX_CHARS]
 
     translator = build_translator()
     if translator is None:

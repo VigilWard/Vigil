@@ -57,7 +57,13 @@ def collect(
     cutoff = now - config.window_hours * 3600
     translator = build_translator(deadline=deadline)
 
-    for source in config.sources:
+    def _priority(source) -> tuple[bool, int]:
+        health = state.health(source.key)
+        # 上一轮被预算跳过的源排到前面：否则它永远在队尾，等它终于被检查时
+        # 窗口外的条目已经被丢掉了（静默漏消息）。其余源按上次成功时间轮转。
+        return health.skipped == 0, health.last_ok
+
+    for source in sorted(config.sources, key=_priority):
         health = state.health(source.key)
 
         if time.monotonic() >= deadline:

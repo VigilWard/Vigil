@@ -142,6 +142,29 @@ def is_metadata_address(host: str) -> bool:
     return any(address in network for network in _METADATA_NETWORKS)
 
 
+def _resolves_to_blocked(host: str) -> bool:
+    """解析主机名，任何一条 A/AAAA 记录落到本机/私网就判可疑。
+
+    `is_blocked_host` 只看字面地址（不解析，避免在重定向处理器里阻塞），
+    挡不住 `127.0.0.1.nip.io` 这类"公网域名指向内网"的写法；这里补上解析这一步。
+
+    DNS 查询失败按"不拦截"处理：真连不上时请求自己会失败，不该在这里谎报成
+    SSRF。真正的 DNS rebinding（解析结果在两次查询之间变化）仍需网络层兜底。
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (OSError, UnicodeError):
+        return False
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+        except (ValueError, IndexError):
+            continue
+        if not address.is_global:
+            return True
+    return False
+
+
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     """阻止 HTTPS 降级；跨主机跳转时丢掉自定义请求头（可能含 token）。
 
@@ -180,6 +203,15 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         ):
             raise urllib.error.HTTPError(
                 newurl, code, "拒绝重定向到本机或私网地址", headers, fp
+            )
+        # 字面地址看不出来的那类：域名本身公网可解析，A 记录却指向内网
+        # （nip.io / sslip.io 这类通配 DNS 是典型写法）。只查跳转目标——
+        # 配置里的初始地址是用户自己写错的，重定向才是外部输入。
+        if _resolves_to_blocked(new_origin[1]) and not (
+            allow_private_hosts() and is_blocked_host(old_origin[1])
+        ):
+            raise urllib.error.HTTPError(
+                newurl, code, "拒绝重定向到解析到本机/私网的主机名", headers, fp
             )
         if old_origin[0] == "https" and new_origin[0] != "https":
             raise urllib.error.HTTPError(newurl, code, "拒绝 HTTPS 降级重定向", headers, fp)
@@ -348,10 +380,15 @@ def _inflate_limited(raw: bytes, deadline: float | None,
             if total > MAX_INFLATE:
                 raise FetchError(f"解压后超过 {MAX_INFLATE} 字节上限")
             out.append(chunk)
+        if engine.eof:
+            # 流已经结束：unconsumed_tail 里剩下的字节是尾随数据（zlib 已把它们
+            # 记进 unused_data）。此时再喂给 decompress()，它既不出数据、也不
+            # 清空 tail——会在这里空转，还把 unused_data 越堆越大。
+            # 触发条件是「解压后超过 64 KiB（max_length 截断）+ 尾随字节」，
+            # 小于 64 KiB 的载荷走不到这条路径。
+            break
         if pending:
             continue          # 输入还没吃完，接着解
-        if engine.eof:
-            break
         if not chunk:
             break             # 既没有剩余输入也没有新输出，说明流本身就到这了
         # 输入吃完了但输出被 max_length 截住，用空输入继续榨

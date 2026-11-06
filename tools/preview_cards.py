@@ -390,8 +390,9 @@ def main(argv: list[str] | None = None) -> int:
     html = TEMPLATE.format(cards="".join(cards), multipage=multipage, mobile=mobile,
                            failures=failures, alerts=alerts_html, testcard=testcard)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(html, encoding="utf-8")
-    print(f"已生成 {out}（{len(html)} 字节）")
+    with out.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(html)
+    print(f"已生成 {out}（{len(html.encode('utf-8'))} 字节）")
     return 0
 
 

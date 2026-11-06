@@ -1,7 +1,11 @@
 __pycache__/
+.venv/
+venv/
+.pytest_cache/
 .ruff_cache/
 .mypy_cache/
 state.json
 state.json.tmp
+state.json.*.tmp
 config.local.json
 preview/

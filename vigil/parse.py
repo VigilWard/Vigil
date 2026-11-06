@@ -390,8 +390,14 @@ _CVSS_KNOWN_VERSIONS = frozenset({"2.0", "3.0", "3.1", "4.0"})
 # 没有小数点的分数（CVSS 10 / CVSS 9）；要求前面是 cvss 且后面不是数字或点。
 # 句末的句号不算"点"："(?!\d)(?!\.\d)" 允许 "CVSS 10."，但挡住 "CVSS 3.1"。
 _CVSS_INT = re.compile(r"cvss\s*[:：=]?\s*(\d{1,2})(?!\d)(?!\.\d)", re.I)
-# 同理：以前 (?![.\d]) 把句末句号也拒了，"CVSS 9.8." 直接解析成 0 分。
-_DECIMAL = re.compile(r"(?<![\d.])(\d{1,2}\.\d)(?!\d)(?!\.\d)")
+# 兜底的裸分数：必须紧跟在 CVSS/评分/风险 后面，最多隔一个连接词。
+# 以前用 _DECIMAL 扫全文，会把 "fixed: 6.6"（内核版本）、"Affected: 4.4"
+# 这类版本号当成 CVSS 分数，给一条只给向量、没给分数的公告编出中危分。
+_CVSS_NEAR = re.compile(
+    r"(?:cvss|评分|风险)\s*(?:评分)?\s*(?:(?:of|is|score)\s*)?[:：=]?\s*"
+    r"(\d{1,2}\.\d)(?!\d)(?!\.\d)",
+    re.I,
+)
 
 
 def _level_of(score: float) -> int:
@@ -405,10 +411,14 @@ def _level_of(score: float) -> int:
 
 
 def _strip_cvss_versions(text: str) -> str:
-    """只剥掉真正的版本号，保留 "CVSS 9.8" 这类裸分数。"""
+    """只剥掉真正的版本号，保留 "CVSS 9.8" 这类裸分数。
+
+    版本号换成一个 " cvss " 占位而不是空串：后面的分数还得靠这个语境词才能
+    被认出来（"CVSS 3.1 9.8" 剥完是 " cvss  9.8"）。
+    """
 
     def replace(match: re.Match[str]) -> str:
-        return " " if match.group(1) in _CVSS_KNOWN_VERSIONS else match.group(0)
+        return " cvss " if match.group(1) in _CVSS_KNOWN_VERSIONS else match.group(0)
 
     return _CVSS_VERSION.sub(replace, text)
 
@@ -436,8 +446,8 @@ def cvss_of(text: str) -> float:
         # 2/3/4 更可能是 "CVSS 3" 这种版本写法，不当成整数分数。
         if value not in {2.0, 3.0, 4.0} and 0 <= value <= 10:
             return value
-    stripped = _strip_cvss_versions(_CVSS_VECTOR.sub(" ", text))
-    match = _DECIMAL.search(stripped)
+    stripped = _strip_cvss_versions(_CVSS_VECTOR.sub(" cvss ", text))
+    match = _CVSS_NEAR.search(stripped)
     if match:
         value = float(match.group(1))
         if 0 <= value <= 10:
@@ -486,9 +496,11 @@ def build_item(
     if link and summary.endswith(link):
         # 不少源把详情页地址也写进正文，和【链接】重复
         summary = summary[: -len(link)].rstrip(" \u3000;；,，.。")
+    # 等级/评分从截断前的正文里读：长公告常把 Severity/CVSS 写在末尾，
+    # 先截到 300 字再判断会把那一整行丢掉（NGINX 分支一直是这么做的）。
+    full_text = title + " " + summary
     summary = shorten(summary, MAX_SUMMARY_CHARS)
     cves = cves or _cves(title, summary)
-    text = title + " " + summary
     return Item(
         source_key=source.key,
         source_name=source.name,
@@ -500,8 +512,8 @@ def build_item(
         cves=cves,
         exploited=source.exploited if exploited is None else exploited,
         ransomware=ransomware,
-        severity=severity_of(text) if severity is None else severity,
-        cvss=cvss_of(text),
+        severity=severity_of(full_text) if severity is None else severity,
+        cvss=cvss_of(full_text),
     )
 
 

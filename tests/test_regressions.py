@@ -313,6 +313,21 @@ class TestOverflowCounting(unittest.TestCase):
         self.assertEqual(len(acked) + 3, len(items))
 
 
+class TestSourceRotation(unittest.TestCase):
+    def test_skipped_source_gets_priority_next_round(self):
+        """被预算跳过的源下一轮排前面。
+
+        否则它永远在队尾，等它终于被检查时，窗口外的条目已经被丢掉——静默漏消息。
+        """
+        first = Source("A", "https://a.test/1")
+        late = Source("B", "https://b.test/2")
+        config = Config([first, late])
+        state = State()
+        state.health(late.key).skipped = 1
+        report = collect(config, state, NOW, deadline=time.monotonic() - 1)
+        self.assertEqual([item.name for item in report.skipped], ["B", "A"])
+
+
 class TestMessageTemplate(unittest.TestCase):
     def setUp(self):
         self.config = Config(sources=[Source("源A", "https://a.test/1")], max_items=50)

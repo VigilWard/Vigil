@@ -254,6 +254,17 @@ class State:
         pairs.sort(key=lambda pair: (-pair[1].published, pair[0]))
         return [item for _, item in pairs]
 
+    def prune_sources(self, valid_keys: set[str]) -> int:
+        """丢掉配置里已经删掉（或 url/kind/match 改过）的源健康记录。
+
+        Source.key 由 url+kind+match 决定：改任一项都会生成新 key，旧记录带着
+        etag 和告警记账留在 state 里，永远不会再被读写，也不会自然过期。
+        """
+        gone = [key for key in self.sources if key not in valid_keys]
+        for key in gone:
+            self.sources.pop(key, None)
+        return len(gone)
+
     def prune_alerts(self, target_ids: set[str]) -> int:
         """丢掉已从配置里删掉的目标的告警记账，返回清掉的条数。
 
@@ -458,7 +469,9 @@ class State:
         self.saved_at = now
         payload["saved_at"] = now
         text = dump_json(payload, indent=None) + "\n"
-        temp = path.with_name(path.name + ".tmp")
+        # 临时文件名带 pid：同一份 checkout 上并发跑两个 watch.py 时，固定名字
+        # 会让先完成的一方把 tmp 换走，另一方的 fd 仍在写已经上线的 state.json。
+        temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         try:
             with temp.open("w", encoding="utf-8", newline="\n") as handle:
                 handle.write(text)

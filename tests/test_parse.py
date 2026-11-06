@@ -116,6 +116,14 @@ class TestRss(unittest.TestCase):
         with self.assertRaises(ParseError):
             parse_rss("<rss><item>", SRC)
 
+    def test_severity_after_summary_window_is_kept(self):
+        """长公告把 Severity 写在 300 字之后：摘要会截断，等级不能跟着丢。"""
+        desc = "细节" * 200 + "Severity: critical CVSS 3.1: 9.8"
+        item = parse_rss(build_rss([("g1", "标题", desc)]), SRC)[0]
+        self.assertEqual(item.severity, 4)
+        self.assertEqual(item.cvss, 9.8)
+        self.assertLessEqual(len(item.summary), 300)
+
     def test_bom_is_tolerated(self):
         payload = "\ufeff" + build_rss([("g1", "带 BOM", "d")])
         self.assertEqual(len(parse_rss(payload, SRC)), 1)

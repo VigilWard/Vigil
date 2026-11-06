@@ -241,6 +241,20 @@ class TestCvss(unittest.TestCase):
         self.assertEqual(cvss_of("CVSS:3.1 9.8"), 9.8)
         self.assertEqual(cvss_of("CVSS 3.1"), 0.0)
 
+    def test_version_numbers_after_context_are_not_scores(self):
+        """回归：只给向量、没给分数时，正文里的内核版本号不能被当成分数。
+
+        旧实现用 _DECIMAL 扫全文，'fixed: 6.6' / 'Affected: 4.4' 会被算成
+        CVSS 6.6 / 4.4，凭空给公告加上中危等级并影响跨源合并。
+        """
+        for text in (
+            "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H\nfixed: 6.6",
+            "CVSS 3.1 vector available; fixed in 6.6",
+            "The CVSS score is not yet published. Affected: 4.4",
+            "This release scores 8.5 on the benchmark",
+        ):
+            self.assertEqual(cvss_of(text), 0.0, text)
+
 
 class TestSafeWrite(unittest.TestCase):
     """Windows 的 GBK 控制台打印 emoji 会抛 UnicodeEncodeError，不能连日志一起消失。"""

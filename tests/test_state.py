@@ -53,7 +53,7 @@ class TestPersistence(StateCase):
 
     def test_atomic_write_leaves_no_temp(self):
         State().save(self.path)
-        self.assertFalse((self.path.parent / "state.json.tmp").exists())
+        self.assertEqual(list(self.path.parent.glob("state.json*.tmp")), [])
 
     def test_corrupt_json_raises_with_hint(self):
         self.path.write_text("{not json", encoding="utf-8")
@@ -199,6 +199,17 @@ class TestRetire(StateCase):
         state.queue(item, 100)
         state.retire(set(), 200)
         self.assertIn(item.key, state.pending)
+
+
+class TestSourceCleanup(unittest.TestCase):
+    def test_prune_sources_drops_stale_keys(self):
+        """改 url/kind/match 会生成新 key，旧健康记录要回收，否则永远留在 state 里。"""
+        state = State()
+        state.health("gone").fail = 2
+        state.health("keep").fail = 1
+        self.assertEqual(state.prune_sources({"keep"}), 1)
+        self.assertNotIn("gone", state.sources)
+        self.assertIn("keep", state.sources)
 
 
 class TestPendingOrder(StateCase):

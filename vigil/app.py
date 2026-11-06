@@ -184,15 +184,15 @@ def build_alerts(
             continue
 
         if kind == "fail":
-            text = f"⚠ {source.name} 已连续 {health.fail} 轮抓取/解析失败，请检查源地址或页面结构。"
+            text = f"⚠ {source.name} 已连续 {health.fail} 轮以上抓取/解析失败，请检查源地址或页面结构。"
         elif kind == "skip":
-            text = f"⚠ {source.name} 已连续 {health.skipped} 轮因时间预算不足未检查，源可能太慢。"
+            text = f"⚠ {source.name} 已连续 {health.skipped} 轮以上因时间预算不足未检查，源可能太慢。"
         elif health.had_items:
-            text = f"⚠ {source.name} 已有内容，但已连续 {health.empty} 轮返回空内容，页面结构可能已变化。"
+            text = f"⚠ {source.name} 已有内容，但已连续 {health.empty} 轮以上返回空内容，页面结构可能已变化。"
         else:
             # 新接入的源一次都没解析出条目：多半是地址写错、或者 match 之外的原因。
             # 以前这种情况既不计 empty 也不告警，源会永远静默。
-            text = (f"⚠ {source.name} 接入后连续 {health.empty} 轮没有解析出任何条目，"
+            text = (f"⚠ {source.name} 接入后连续 {health.empty} 轮以上没有解析出任何条目，"
                     "请检查源地址与解析规则。")
         alerts.append(Alert(kind, source.key, text, need))
     return alerts
@@ -230,7 +230,6 @@ def _alert_chunks(alerts: list[Alert], budget: int):
             yield chunk
             chunk = []
             size = 0
-            separator = 0
         if length > budget:
             # 正常不会走到这里（源名有长度上限），但保留兜底。
             text = shorten_bytes(text, budget)
@@ -338,6 +337,10 @@ def cmd_run(config: Config, state: State, state_path) -> int:
     targets = load_targets()
     # 抓取单独限时，给推送和告警留出剩余预算
     report = collect(config, state, now, deadline=start + FETCH_BUDGET)
+    # 配置里删掉/改了身份的源，健康记录不再有人读，顺手回收（否则永远留在 state 里）
+    dropped = state.prune_sources({source.key for source in config.sources})
+    if dropped:
+        log(f"   清理了 {dropped} 条已删除源的记录")
     # 先落盘：即使后面进程被杀，基线和队列也不会丢
     state.save(state_path)
 
@@ -475,7 +478,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state", default=str(STATE_FILE), help="状态文件路径")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--test", action="store_true", help="只发一条测试消息")
-    modes.add_argument("--dry-run", action="store_true", help="只打印将要推送的内容，不发送、不改基线")
+    modes.add_argument("--dry-run", action="store_true",
+                       help="只打印将要推送的内容：不发飞书、不改基线（开着翻译时仍会请求翻译接口）")
     modes.add_argument("--reset", action="store_true", help="清空基线与待送达队列")
     args = parser.parse_args(argv)
 
