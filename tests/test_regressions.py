@@ -306,9 +306,9 @@ class TestOverflowCounting(unittest.TestCase):
         items = [Item(source_key=source.key, source_name=source.name, uid=f"u{i}",
                       title=f"标题 {i}", link="", published=100 - i, summary="")
                  for i in range(5)]
-        messages = compose(config, items, NOW, max_messages=2)
+        messages = compose(config, items, max_messages=2)
         self.assertEqual(len(messages), 2)
-        self.assertIn("另有 3 条顺延到下一轮", messages[-1].subtitle)
+        self.assertIn("另有 3 条顺延到下一轮", messages[-1].body)
         acked = {key for message in messages for key in message.keys}
         self.assertEqual(len(acked) + 3, len(items))
 
@@ -330,7 +330,7 @@ class TestMessageTemplate(unittest.TestCase):
 
     def test_each_message_uses_its_own_template(self):
         """一条公告一条消息：红色只属于在野利用那条，不会把整批都染红。"""
-        messages = compose(self.config, self._items(20), NOW)
+        messages = compose(self.config, self._items(20))
         self.assertEqual(messages[0].template, "red")
         for message in messages[1:]:
             self.assertEqual(message.template, "blue")
@@ -346,7 +346,7 @@ class TestEscapedPayloadSize(unittest.TestCase):
                       published=1000 - i, summary="*_[]()#+`$!\\ " * 20,
                       cves=("CVE-2026-1111",), severity=4, cvss=9.8)
                  for i in range(30)]
-        pages = compose(config, items, 1793000000)
+        pages = compose(config, items)
         self.assertTrue(pages)
         for page in pages:
             payload = feishu._payload(
@@ -385,7 +385,7 @@ class TestSourceNameInSubtitle(unittest.TestCase):
         source = config.sources[0]
         item = Item(source_key=source.key, source_name=source.name, uid="u1",
                     title="标题", link="", published=1, summary="")
-        message = compose(config, [item], 1793000000)[0]
+        message = compose(config, [item])[0]
         self.assertIn("A*B", message.subtitle)
         self.assertNotIn("&#42;", message.subtitle)
 
@@ -765,14 +765,14 @@ class TestFailureNotice(unittest.TestCase):
     def test_failure_notice_without_items_is_not_sent(self):
         """没有条目就不发卡片：源异常只在有内容时搭车，README 明确不单发空卡片。"""
         config = Config(sources=[Source("源A", "https://a.test/1")])
-        messages = compose(config, [], NOW, failures=[Failure("坏源", "k", "HTTP 500")])
+        messages = compose(config, [], failures=[Failure("坏源", "k", "HTTP 500")])
         self.assertEqual(messages, [])
 
     def test_failure_notice_rides_with_items(self):
         config = Config(sources=[Source("源A", "https://a.test/1")])
         items = [Item(source_key=config.sources[0].key, source_name="源A", uid="u1",
                       title="标题", link="", published=1, summary="")]
-        messages = compose(config, items, 1793000000, failures=[Failure("坏源", "k", "HTTP 500")])
+        messages = compose(config, items, failures=[Failure("坏源", "k", "HTTP 500")])
         self.assertIn("抓取失败：坏源", messages[0].body)
         self.assertEqual(len(messages[0].keys), 1)
 
@@ -1273,7 +1273,7 @@ class TestOneMessagePerItem(unittest.TestCase):
         items = [Item(source_key=config.sources[0].key, source_name="源A", uid=f"u{i}",
                       title=f"标题 {i}", link="", published=1000 - i, summary="描述")
                  for i in range(10)]
-        messages = compose(config, items, NOW)
+        messages = compose(config, items)
         self.assertEqual(len(messages), 10)
         for message in messages:
             self.assertEqual(len(message.keys), 1)

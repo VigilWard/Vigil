@@ -2,7 +2,7 @@
 
 为什么不把多条塞进一张卡片：
   一张卡片里按「源 → 等级」分组，普通漏洞会把高危漏洞夹在中间，扫消息时
-  很难一眼挑出来。拆成一条一条之后，每张卡片自己的头部配色、图标和副标题
+  很难一眼挑出来。拆成一条一条之后，每张卡片自己的头部配色和图标
   都在说"这条有多要紧"，等级再也不会被邻居淹没。
 
 同一份内容有两种输出：
@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -38,6 +39,17 @@ SEVERITY_ICONS = {1: "⚪", 2: "🟡", 3: "🟠", 4: "🔴"}
 EXPLOITED_ICON = "🚨"
 # 卡片头部标题只用来"认消息"，不承载全文；正文里的【标题原文】才是完整版。
 HEADER_TITLE_CHARS = 60
+# 副标题在飞书客户端里**只能显示一行**（官方文档：超出一行用 ... 省略）。PC 卡片宽、
+# 手机卡片窄，同一条副标题在手机上会被切掉尾巴，曾经把排在最后的「第 3/30 条」
+# 切成「第 3/…」。两条对策同时生效：
+#   1) 序号永远排在最前面：之后无论怎么截，被吃掉的都只是源名；
+#   2) 整行按 30 个"半角宽度"自己收口：宁可少写几个字，也不让客户端动刀。
+# 30 来自实测——手机上一行大约排得下 35 个半角宽度，余量用来抵消字号设置和
+# 卡片边距的差异。因此副标题不再放"本轮推送时间"和"等级文字"：前者就是消息自身
+# 的发送时间（每 10 分钟一轮，翻消息时飞书会显示），后者已经由标题前的图标、
+# 头部配色和正文【等级】表达。
+SUBTITLE_COLUMNS = 30
+SUBTITLE_SEPARATOR = " · "
 
 # 飞书的 lark_md 不支持反斜杠转义，官方要求把命中的特殊字符换成 HTML 实体，
 # 否则标题里的 * 会把后面的文字吃掉。& 必须一起换，避免二次解析。
@@ -80,6 +92,43 @@ class Message:
 def escape_md(text: str) -> str:
     """把动态文本里的 markdown 控制字符换成 HTML 实体（飞书 lark_md 的转义方式）。"""
     return _MD_ESCAPE_RE.sub(lambda match: _MD_ESCAPES[match.group(0)], text)
+
+
+def _char_width(char: str) -> int:
+    """一个字符占几个"半角宽度"：汉字、全角标点和 emoji 算 2，其余算 1。"""
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def display_width(text: str) -> int:
+    """按"半角宽度"估算一行能排下多少字符。
+
+    飞书没有公开副标题的像素宽度，这里只用来做保守收口：
+    宁可我们自己提前少写，也不要让客户端把「第 3/30 条」截成「第 3/…」。
+    `·`（分隔符）和 `…`（省略号）属于 East Asian Ambiguous，中文界面下往往占满
+    一个汉字宽，这里按 1 计——SUBTITLE_COLUMNS 相对手机实际容量留的余量足以吸收
+    这点误差（一条副标题里最多一个 `·` 加一个 `…`，最多多算 2 列）。
+    """
+    return sum(_char_width(char) for char in text)
+
+
+def shorten_display(text: str, budget: int) -> str:
+    """按显示宽度截断，超长时以 … 结尾（不会切出半个字）。"""
+    if display_width(text) <= budget:
+        return text
+    if budget < 2:
+        # 连「一个字 + 省略号」都放不下：宁可留空，也不要留一个孤零零的「…」
+        return ""
+    kept = []
+    used = 0
+    for char in text:
+        width = _char_width(char)
+        if used + width > budget - 1:   # 留 1 个宽度给省略号
+            break
+        kept.append(char)
+        used += width
+    trimmed = "".join(kept).rstrip()
+    # 前导空白也可能把预算吃光，此时同样不要留下孤零零的省略号
+    return f"{trimmed}…" if trimmed else ""
 
 
 # 链接里能构造出标记的字符：<> 拼标签，* ~ ` 拼强调，[] 拼 [文本](地址)。
@@ -278,23 +327,22 @@ def _header_title(item: Item) -> str:
     return f"{icon} {title}" if icon else title
 
 
-def _subtitle(item: Item, stamp: str, index: int, total: int, overflow: int) -> str:
-    parts = [item.source_name, stamp]
-    marks = []
-    if item.exploited:
-        marks.append("在野利用")
-    if item.severity >= 1:
-        label = SEVERITY_LABELS.get(item.severity, "")
-        if item.cvss:
-            label = f"{label}（CVSS {item.cvss:.1f}）"
-        marks.append(label)
-    if marks:
-        parts.append(" · ".join(marks))
-    if total > 1:
-        parts.append(f"第 {index}/{total} 条")
-    if overflow:
-        parts.append(f"另有 {overflow} 条顺延到下一轮")
-    return " · ".join(part for part in parts if part)
+def _subtitle(item: Item, index: int, total: int) -> str:
+    """卡片副标题：序号在前，源名在后。
+
+    副标题只有一行，所以序号必须排在最前面：这一行无论被谁截断，都不能把
+    「第 3/30 条」切成「第 3/…」。源名再按剩余宽度收一次口，让整行尽量完整
+    落在手机的一行里；完整源名在正文【来源】里，截短不会丢信息。
+    """
+    source = _inline(item.source_name)
+    if total <= 1:
+        return shorten_display(source, SUBTITLE_COLUMNS)
+    counter = f"第 {index}/{total} 条"
+    if not source:
+        return counter
+    room = SUBTITLE_COLUMNS - display_width(counter) - display_width(SUBTITLE_SEPARATOR)
+    shortened = shorten_display(source, room)
+    return f"{counter}{SUBTITLE_SEPARATOR}{shortened}" if shortened else counter
 
 
 def card_template(item: Item) -> str:
@@ -314,7 +362,6 @@ def card_template(item: Item) -> str:
 def compose(
     config: Config,
     items: list[Item],
-    now: int,
     *,
     failures: list[Failure] | None = None,
     skipped: list[Failure] | None = None,
@@ -345,7 +392,6 @@ def compose(
     overflow = deferred + max(0, len(selected) - max_messages)
     selected = selected[:max_messages]
 
-    stamp = f"{datetime.fromtimestamp(now, CST):%m-%d %H:%M}"
     if not selected:
         # 没有条目就什么都不发：源异常提示只在有内容时搭车（app._deliver 在
         # 队列为空时直接返回，根本不会调到这里）。单独发"状态卡片"会让一个
@@ -357,16 +403,23 @@ def compose(
     messages: list[Message] = []
     for index, item in enumerate(selected, 1):
         body = render_item(item, markup=markup)
-        if index == 1 and notes:
+        # 整句提示搭车进正文：源异常跟第一条，顺延跟最后一条，都不额外占消息。
+        # 这两类话都太长，塞不进只有一行的副标题，而正文顶部不会被截断。
+        tops = []
+        if index == 1:
             # 源异常提示搭第一条的车：不额外占一条消息，也不会因为后面某条
             # 推送失败而丢掉（第一条失败时整轮都不会确认，下一轮会重发）
-            body = "\n".join(notes) + "\n\n" + body
+            tops.extend(notes)
+        if index == total and overflow:
+            tops.append(f"⚠ 另有 {overflow} 条顺延到下一轮")
+        if tops:
+            body = "\n".join(tops) + "\n\n" + body
         if len(body.encode("utf-8", "replace")) > budget:
             log("⚠ 单条公告超过消息预算，已截断")
             body = shorten_bytes(body, budget)
         messages.append(Message(
             _header_title(item),
-            _subtitle(item, stamp, index, total, overflow if index == total else 0),
+            _subtitle(item, index, total),
             body.rstrip("\n"),
             [item.key, *item.merged],
             card_template(item),

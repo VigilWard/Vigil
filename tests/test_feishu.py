@@ -134,7 +134,7 @@ class TestResponseHandling(unittest.TestCase):
 
 class TestCard(unittest.TestCase):
     def test_card_structure(self):
-        message = Message("🔴 Ivanti 认证绕过", "CISA KEV · 11-01 21:50 · 严重（CVSS 9.8） · 第 1/1 条",
+        message = Message("🔴 Ivanti 认证绕过", "CISA KEV",
                           "【编号】CVE-2026-1111", template="red")
         card = feishu.card_of(message)
 
@@ -177,7 +177,7 @@ class TestCard(unittest.TestCase):
                  cves=("CVE-2026-1111",), severity=4, cvss=9.8)
             for i in range(40)
         ]
-        messages = compose(config, items, 1793000000, budget=MAX_CARD_BODY_BYTES)
+        messages = compose(config, items, budget=MAX_CARD_BODY_BYTES)
         self.assertTrue(messages)
         for message in messages:
             payload = feishu._payload(

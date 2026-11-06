@@ -66,7 +66,7 @@ def lark_to_html(text: str) -> str:
     return text
 
 
-def render_card(message, note: str, code: str) -> str:
+def render_card(message, note: str, code: str, *, narrow: bool = False) -> str:
     card = card_of(message)
     head = card["header"]
     title = html_mod.escape(head["title"]["content"])
@@ -77,8 +77,11 @@ def render_card(message, note: str, code: str) -> str:
     color = HEAD_COLORS.get(message.template, HEAD_COLORS["blue"])
     sub_html = f'<div class="card-sub">{subtitle}</div>' if subtitle else ""
     body_html = lark_to_html(body) if body else ""
+    # narrow=True 用手机宽度渲染：飞书手机端的卡片窄得多，副标题只有一行，
+    # 这个视图能直接看出「第 3/30 条」会不会被吃掉。
+    cls = "demo narrow" if narrow else "demo"
     return f"""
-    <figure class="demo">
+    <figure class="{cls}">
       <figcaption><b>{note}</b><code>{html_mod.escape(code)}</code></figcaption>
       <div class="card">
         <div class="card-head" style="background:{color}">
@@ -231,7 +234,11 @@ TEMPLATE = """<!doctype html>
     box-shadow:0 1px 3px rgba(31,35,41,.12); }}
   .card-head {{ padding:12px 16px; color:#fff; }}
   .card-title {{ font-size:16px; font-weight:600; line-height:1.4; }}
-  .card-sub {{ font-size:12px; opacity:.85; margin-top:2px; }}
+  /* 飞书客户端的副标题只有一行，放不下就 "…"；预览里也照这个规则显示 */
+  .card-sub {{ font-size:12px; opacity:.85; margin-top:2px; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; }}
+  /* 手机宽度：卡片比 PC 窄得多，用来检查副标题会不会被截断 */
+  .demo.narrow .card {{ max-width:340px; }}
   .card-body {{ padding:14px 16px 16px; white-space:pre-wrap; word-break:break-word;
     font-size:14px; line-height:1.75; }}
   .c-red {{ color:var(--red); }}
@@ -261,8 +268,10 @@ TEMPLATE = """<!doctype html>
   {cards}
 
   <h2>二、消息条数与顺延</h2>
-  <p class="h2sub">单轮单目标最多 30 条；放不下的条目留在队列，下一轮优先补发。</p>
+  <p class="h2sub">单轮单目标最多 30 条；放不下的条目留在队列，下一轮优先补发。
+    下面是同一条消息在普通宽度和手机宽度（约 340px）下的样子：副标题只有一行，序号在前，不会被截成「第 3/…」。</p>
   {multipage}
+  {mobile}
 
   <h2>三、源异常提示</h2>
   <p class="h2sub">抓取失败、被时间预算跳过的源会写在第一条消息的正文最上面，不额外占一条消息。</p>
@@ -312,36 +321,40 @@ def main(argv: list[str] | None = None) -> int:
 
     cards = []
     cards.append(render_card(
-        compose(config, [demo["exploited"]], NOW, budget=budget)[0],
+        compose(config, [demo["exploited"]], budget=budget)[0],
         "在野利用 + 勒索标记（🚨 红底）", 'card_template() == "red"'))
     cards.append(render_card(
-        compose(config, [demo["critical"]], NOW, budget=budget)[0],
+        compose(config, [demo["critical"]], budget=budget)[0],
         "严重漏洞，跨源合并（含【另见】）", 'card_template() == "carmine"'))
     cards.append(render_card(
-        compose(config, [demo["high"]], NOW, budget=budget)[0],
+        compose(config, [demo["high"]], budget=budget)[0],
         "高危（🟠 橙底）", 'card_template() == "orange"'))
     cards.append(render_card(
-        compose(config, [demo["medium"]], NOW, budget=budget)[0],
+        compose(config, [demo["medium"]], budget=budget)[0],
         "中危（🟡 蓝底）", 'card_template() == "blue"'))
     cards.append(render_card(
-        compose(config, [demo["low"]], NOW, budget=budget)[0],
+        compose(config, [demo["low"]], budget=budget)[0],
         "低危（⚪ 灰色等级）", 'card_template() == "blue"'))
     cards.append(render_card(
-        compose(config, [demo["plain"]], NOW, budget=budget)[0],
+        compose(config, [demo["plain"]], budget=budget)[0],
         "没有等级：标题前不加图标", 'card_template() == "blue"'))
     cards.append(render_card(
-        compose(config, [demo["minimal"]], NOW, budget=budget)[0],
+        compose(config, [demo["minimal"]], budget=budget)[0],
         "只有标题也能单独成一条", 'compose(...)[0]'))
 
     bulk_config, bulk = build_multipage(config)
-    bulk_messages = compose(bulk_config, bulk, NOW, budget=budget)
+    bulk_messages = compose(bulk_config, bulk, budget=budget)
     multipage = render_card(
         bulk_messages[-1],
         f"共 {len(bulk_messages)} 条消息，这里看最后一条（含顺延提示）",
         "compose(...)[-1]")
+    mobile = render_card(
+        bulk_messages[-1],
+        "同一张卡片，手机宽度（约 340px）：序号完整，副标题不被截断",
+        "render_card(..., narrow=True)", narrow=True)
 
     failures = render_card(
-        compose(config, [demo["medium"]], NOW, budget=budget,
+        compose(config, [demo["medium"]], budget=budget,
                 failures=[Failure("oss-security", "k1", "HTTP 403")],
                 skipped=[Failure("Ubuntu USN", "k2", "整轮时间预算不足")])[0],
         "有源抓取失败 / 被跳过", "compose(failures=..., skipped=...)")
@@ -359,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
 
     testcard = render_card(sample_message(), "测试消息", "app.sample_message()")
 
-    html = TEMPLATE.format(cards="".join(cards), multipage=multipage,
+    html = TEMPLATE.format(cards="".join(cards), multipage=multipage, mobile=mobile,
                            failures=failures, alerts=alerts_html, testcard=testcard)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html, encoding="utf-8")

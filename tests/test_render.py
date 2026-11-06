@@ -4,11 +4,14 @@ import unittest
 from vigil.collect import merge
 from vigil.models import MAX_CARD_BODY_BYTES, Config, Failure, Item, Source
 from vigil.render import (
+    SUBTITLE_COLUMNS,
     card_template,
     compose,
+    display_width,
     render_item,
     sanitize_link,
     select_items,
+    shorten_display,
 )
 
 
@@ -261,7 +264,7 @@ class TestCompose(unittest.TestCase):
         self.config = Config(sources=[Source("源A", "https://a.test/1")], max_items=50)
 
     def test_one_message_per_item(self):
-        messages = compose(self.config, items_for(self.config, 3), 1793000000)
+        messages = compose(self.config, items_for(self.config, 3))
         self.assertEqual(len(messages), 3)
         for message in messages:
             self.assertEqual(len(message.keys), 1)
@@ -274,56 +277,59 @@ class TestCompose(unittest.TestCase):
             make_item(3, source_key=source.key, severity=3, published=700),
             make_item(4, source_key=source.key, exploited=True, severity=1, published=100),
         ]
-        messages = compose(self.config, items, 1793000000)
+        messages = compose(self.config, items)
         self.assertIn("u4", messages[0].keys[0])
         self.assertIn("u3", messages[1].keys[0])
         self.assertIn("u2", messages[2].keys[0])
         self.assertIn("u1", messages[3].keys[0])
 
-    def test_header_shows_severity_icon_and_source(self):
+    def test_header_keeps_icon_and_source(self):
+        """副标题只有一行，只放序号和源名；等级靠图标/配色和正文【等级】表达。"""
         item = make_item(1, severity=4, cvss=9.8, cves=("CVE-2026-1111",))
-        message = compose(self.config, [item], 1793000000)[0]
+        message = compose(self.config, [item])[0]
         self.assertTrue(message.title.startswith("🔴 "))
         self.assertIn("源A", message.subtitle)
-        self.assertIn("严重（CVSS 9.8）", message.subtitle)
+        self.assertNotIn("CVSS", message.subtitle)
         self.assertEqual(message.template, "carmine")
         self.assertIn("【编号】CVE-2026-1111", message.body)
+        self.assertIn("【等级】<font color='red'>严重（CVSS 9.8）</font>", message.body)
 
     def test_exploited_uses_alarm_icon_and_red(self):
         item = make_item(1, exploited=True, severity=4)
-        message = compose(self.config, [item], 1793000000)[0]
+        message = compose(self.config, [item])[0]
         self.assertTrue(message.title.startswith("🚨 "))
-        self.assertIn("在野利用", message.subtitle)
+        self.assertNotIn("在野利用", message.subtitle)
         self.assertEqual(message.template, "red")
         self.assertIn("已确认在野利用", message.body)
 
     def test_message_index_in_subtitle(self):
-        messages = compose(self.config, items_for(self.config, 3), 1793000000)
+        messages = compose(self.config, items_for(self.config, 3))
         for index, message in enumerate(messages, 1):
-            self.assertIn(f"第 {index}/3 条", message.subtitle)
+            # 序号必须在最前面：手机端副标题只有一行，被截时先丢末尾的源名
+            self.assertTrue(message.subtitle.startswith(f"第 {index}/3 条 · "), message.subtitle)
 
     def test_max_messages_limits_and_reports_overflow(self):
-        messages = compose(self.config, items_for(self.config, 5), 1793000000, max_messages=3)
+        messages = compose(self.config, items_for(self.config, 5), max_messages=3)
         self.assertEqual(len(messages), 3)
-        self.assertIn("另有 2 条顺延到下一轮", messages[-1].subtitle)
+        self.assertIn("另有 2 条顺延到下一轮", messages[-1].body)
         for message in messages[:-1]:
-            self.assertNotIn("顺延", message.subtitle)
+            self.assertNotIn("顺延", message.body)
 
     def test_per_source_limit_counts_as_overflow(self):
         config = Config(sources=[Source("源A", "https://a.test/1", limit=2)], max_items=10)
-        messages = compose(config, items_for(config, 5), 1793000000)
+        messages = compose(config, items_for(config, 5))
         self.assertEqual(len(messages), 2)
-        self.assertIn("另有 3 条顺延到下一轮", messages[-1].subtitle)
+        self.assertIn("另有 3 条顺延到下一轮", messages[-1].body)
 
     def test_body_stays_within_budget(self):
         items = items_for(self.config, 60, summary="很长的中文描述" * 20)
-        messages = compose(self.config, items, 1793000000, budget=MAX_CARD_BODY_BYTES)
+        messages = compose(self.config, items, budget=MAX_CARD_BODY_BYTES)
         self.assertTrue(messages)
         for message in messages:
             self.assertLessEqual(len(message.body.encode("utf-8")), MAX_CARD_BODY_BYTES)
 
     def test_notes_ride_with_the_first_message(self):
-        messages = compose(self.config, items_for(self.config, 2), 1793000000,
+        messages = compose(self.config, items_for(self.config, 2),
                            failures=[Failure("坏源", "k", "x")],
                            skipped=[Failure("慢源", "k2", "y")])
         self.assertIn("抓取失败：坏源", messages[0].body)
@@ -331,18 +337,58 @@ class TestCompose(unittest.TestCase):
         self.assertNotIn("抓取失败", messages[1].body)
 
     def test_empty_items(self):
-        self.assertEqual(compose(self.config, [], 1793000000), [])
+        self.assertEqual(compose(self.config, []), [])
 
     def test_markup_toggle(self):
         items = items_for(self.config, 1, severity=4, cvss=9.8)
-        self.assertIn("<font", compose(self.config, items, 1793000000)[0].body)
-        self.assertNotIn("<font", compose(self.config, items, 1793000000, markup=False)[0].body)
+        self.assertIn("<font", compose(self.config, items)[0].body)
+        self.assertNotIn("<font", compose(self.config, items, markup=False)[0].body)
 
     def test_as_text_contains_title_and_body(self):
         item = make_item(1, title="标题一", severity=4)
-        text = compose(self.config, [item], 1793000000, markup=False)[0].as_text()
+        text = compose(self.config, [item], markup=False)[0].as_text()
         self.assertTrue(text.startswith("🔴 标题一 · "))
         self.assertIn("\n【标题原文】标题一", text)
+
+
+class TestSubtitleWidth(unittest.TestCase):
+    """副标题只有一行：序号不能被截断，整行要能排进手机宽度。
+
+    飞书文档只承诺"副标题最多一行，超出用 ... 省略"，没有给像素宽度；
+    PC 卡片宽、手机卡片窄，所以这里锁的是"我们自己收口"的行为。
+    """
+
+    def test_counter_comes_first_and_line_fits_budget(self):
+        source = Source("超长源名" * 10, "https://b.test/2")
+        config = Config(sources=[source], max_items=50)
+        items = [
+            Item(source_key=source.key, source_name=source.name, uid=f"u{i}",
+                 title=f"标题 {i}", link="", published=100 - i)
+            for i in range(3)
+        ]
+        for index, message in enumerate(compose(config, items), 1):
+            self.assertTrue(message.subtitle.startswith(f"第 {index}/3 条 · "), message.subtitle)
+            self.assertLessEqual(display_width(message.subtitle), SUBTITLE_COLUMNS)
+            self.assertTrue(message.subtitle.endswith("…"), message.subtitle)
+
+    def test_single_message_shows_source_only(self):
+        item = Item(source_key="s1", source_name="源A", uid="u1", title="标题", published=1)
+        config = Config(sources=[Source("源A", "https://a.test/1")])
+        self.assertEqual(compose(config, [item])[0].subtitle, "源A")
+
+    def test_display_width_counts_cjk_as_two(self):
+        self.assertEqual(display_width("ab"), 2)
+        self.assertEqual(display_width("中文"), 4)
+        self.assertEqual(display_width("第 1/2 条"), 9)
+
+    def test_shorten_display_keeps_whole_chars(self):
+        self.assertEqual(shorten_display("", 0), "")
+        self.assertEqual(shorten_display("abc", 3), "abc")     # 刚好放得下就不动它
+        self.assertEqual(shorten_display("abc", 2), "a…")      # 一个字 + 省略号
+        self.assertEqual(shorten_display("中文", 3), "中…")     # 不切半个汉字
+        self.assertEqual(shorten_display("中a文b", 4), "中a…")
+        # 前导空白把预算吃光时不能留一个孤零零的省略号
+        self.assertEqual(shorten_display("  abc", 3), "")
 
 
 class TestLinkSanitizing(unittest.TestCase):
@@ -393,7 +439,7 @@ class TestUndatedOrder(unittest.TestCase):
                  title=title, published=0)
             for index, title in enumerate(titles)
         ]
-        self.assertEqual([m.title for m in compose(config, items, 1793000000)], titles)
+        self.assertEqual([m.title for m in compose(config, items)], titles)
 
 
 class TestCardTemplate(unittest.TestCase):
@@ -456,7 +502,7 @@ class TestMerge(unittest.TestCase):
         """被合并掉的条目虽然不渲染，但它的 key 必须跟着上消息，否则永远不会被 ack。"""
         kev = self._item(self.kev, "k1", "CVE-2026-1111", exploited=True)
         oss = self._item(self.oss, "o1", "CVE-2026-1111")
-        message = compose(self.config, merge([oss, kev], self.config), 1793000000)[0]
+        message = compose(self.config, merge([oss, kev], self.config))[0]
         self.assertIn(kev.key, message.keys)
         self.assertIn(oss.key, message.keys)
 

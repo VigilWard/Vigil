@@ -309,7 +309,7 @@ def _deliver(
         if not items:
             continue
         messages = compose(
-            config, items, now,
+            config, items,
             failures=report.failures,
             skipped=report.skipped,
             budget=MAX_CARD_BODY_BYTES,
@@ -405,7 +405,7 @@ def cmd_dry_run(config: Config, state_path) -> int:
         return 0
 
     # 用和线上一致的卡片预算与消息上限渲染，否则这里显示的条数和实际发出去的对不上
-    messages = compose(config, items, now, failures=report.failures,
+    messages = compose(config, items, failures=report.failures,
                        skipped=report.skipped, markup=False, budget=MAX_CARD_BODY_BYTES,
                        max_messages=MAX_MESSAGES)
     for index, message in enumerate(messages, 1):
@@ -421,7 +421,7 @@ def sample_message() -> Message:
     """--test 发的示例卡片；预览工具也复用它，保证演示和线上一致。"""
     return Message(
         "🔴 Vigil 测试消息",
-        "webhook、签名与卡片渲染正常 · 严重（CVSS 9.8） · 第 1/1 条",
+        "Vigil 测试源",
         "【来源】Vigil 测试源\n"
         "【编号】CVE-2026-00000\n"
         "【发布时间】2026-11-01 09:15\n"
