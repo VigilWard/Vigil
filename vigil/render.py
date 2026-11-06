@@ -32,6 +32,9 @@ from .models import (
 )
 
 CVE_TITLE_PREFIX = re.compile(r"^(?:CVE-\d{4}-\d{4,8}[\s:：]+)+", re.I)
+# 内核 CVE 团队用 "REJECTED: CVE-…" 作撤稿通知的标题：编号已经作废，正文里必须
+# 点名，否则它看起来和一条新漏洞一模一样（还会占掉内核源每轮的展示名额）。
+REJECTED_TITLE_PREFIX = re.compile(r"^\s*REJECTED\b", re.I)
 SEVERITY_LABELS = {1: "低", 2: "中", 3: "高", 4: "严重"}
 # 卡片头部只能放纯文本，颜色又不能只靠模板色区分（蓝底同时覆盖中/低/未知），
 # 所以标题前面再加一个字符标记，扫消息列表时不用点开也能看出等级。
@@ -204,21 +207,32 @@ def _display_title(item: Item) -> str:
     return title
 
 
+def _titles(item: Item) -> tuple[str, str]:
+    """返回 (原文标题, 译文标题)；没有译文、或译文与原文一模一样时第二项是空串。
+
+    译文也要去掉开头重复的 CVE 号。译文与原文相同是常态（中文源、或翻译接口
+    原样返回），此时不能把它当成"有译文"，否则卡片上会出现两行一样的内容。
+    """
+    original = _display_title(item)
+    translated = shorten(_inline(item.title_zh), MAX_TITLE_CHARS)
+    if translated and item.cves:
+        stripped = CVE_TITLE_PREFIX.sub("", translated).strip()
+        if stripped:
+            translated = stripped
+    if translated == original:
+        translated = ""
+    return original, translated
+
+
 def render_item(item: Item, *, markup: bool = True) -> str:
     """一条漏洞渲染成字段化的多行文本。字段没有值就整行省略，不留空壳。
 
     标题和摘要都拆成「翻译 / 原文」两行：有译文时两行都给（译文在上、原文在下），
     没译文时只给原文那一行。标签必须和内容对得上——不能把英文挂在「翻译」下面。
     """
-    title = _display_title(item)
-
-    title_zh = shorten(_inline(item.title_zh), MAX_TITLE_CHARS)
-    if title_zh and item.cves:
-        stripped = CVE_TITLE_PREFIX.sub("", title_zh).strip()
-        if stripped:
-            title_zh = stripped
-    # 译文和原文一样（中文源、或 Google 原样返回）时不算翻译，否则会出现两行一模一样
-    translated_title = bool(title_zh) and title_zh != title
+    title, title_zh = _titles(item)
+    # 译文与原文相同时 _titles() 已经折成空串，这里只看有没有译文
+    translated_title = bool(title_zh)
 
     lines = []
     # 来源放第一行：一条公告一条消息之后，卡片标题是公告本身，源名只出现在
@@ -240,6 +254,14 @@ def render_item(item: Item, *, markup: bool = True) -> str:
         lines.append("【标题原文】" + (escape_md(title) if markup else title))
     else:
         lines.append("【标题原文】" + (f"**{escape_md(title)}**" if markup else title))
+
+    # 撤稿通知本身没有可利用的信息，唯一要传达的是"这个编号作废了"，
+    # 所以紧跟标题、用红色标出：漏看这一行就会继续把它当成一条新漏洞。
+    if REJECTED_TITLE_PREFIX.match(title):
+        withdrawn = "该编号已作废，不再是有效 CVE"
+        if markup:
+            withdrawn = f"<font color='red'>{withdrawn}</font>"
+        lines.append("【撤销CVE】" + withdrawn)
 
     if item.severity >= 1:
         label = SEVERITY_LABELS.get(item.severity, "")
@@ -322,7 +344,13 @@ def _rank(item: Item) -> tuple:
 
 
 def _header_title(item: Item) -> str:
-    title = shorten(_display_title(item), HEADER_TITLE_CHARS) or "（无标题）"
+    """卡片头部标题：有译文就用译文，没有（或与原文相同）时回落原文。
+
+    头部是扫消息时唯一会看的地方，中文比英文原文更快认出来；完整原文仍在
+    正文【标题原文】里，不靠这里承载。
+    """
+    original, translated = _titles(item)
+    title = shorten(translated or original, HEADER_TITLE_CHARS) or "（无标题）"
     icon = EXPLOITED_ICON if item.exploited else SEVERITY_ICONS.get(item.severity, "")
     return f"{icon} {title}" if icon else title
 

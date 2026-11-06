@@ -109,7 +109,8 @@ def build_demo():
     debian = Source("Debian DSA", "https://www.debian.org/security/dsa-long", limit=3)
     ubuntu = Source("Ubuntu USN", "https://ubuntu.com/security/notices/rss.xml", limit=3)
     nginx = Source("NGINX", "https://nginx.org/en/security_advisories.html", kind="nginx", limit=2)
-    config = Config([kev, oss, debian, ubuntu, nginx], max_items=8)
+    kernel = Source("Linux 内核 CVE", "https://lore.kernel.org/linux-cve-announce/new.atom", limit=4)
+    config = Config([kev, oss, debian, ubuntu, nginx, kernel], max_items=8)
 
     def item(source, uid, **kwargs):
         base = {"source_key": source.key, "source_name": source.name, "uid": uid,
@@ -180,8 +181,18 @@ def build_demo():
         link="",
     )
 
+    rejected = item(
+        kernel, "rejected-99252",
+        title="REJECTED: CVE-2026-99252: io_uring/mpscq: disable preemption while pushing",
+        link="https://lore.kernel.org/linux-cve-announce/2026/msg00123.html",
+        summary="CVE-2026-99252 has now been rejected and is no longer a valid CVE.",
+        summary_zh="CVE-2026-99252 已被撤销，不再是有效编号。",
+        cves=("CVE-2026-99252",),
+    )
+
     return config, {"exploited": exploited, "critical": critical, "high": high,
-                    "medium": medium, "low": low, "plain": plain, "minimal": minimal}
+                    "medium": medium, "low": low, "plain": plain, "minimal": minimal,
+                    "rejected": rejected}
 
 
 def build_multipage(config: Config):
@@ -293,6 +304,7 @@ TEMPLATE = """<!doctype html>
     <tr><td>【发布时间】</td><td>源里能读到发布时间时</td><td>东八区，YYYY-MM-DD HH:MM</td></tr>
     <tr><td>【标题翻译】</td><td>有译文且与原文不同</td><td>加粗；开头重复的 CVE 号会被剥掉</td></tr>
     <tr><td>【标题原文】</td><td>总是</td><td>没有译文时由它加粗，充当主标题</td></tr>
+    <tr><td>【撤销CVE】</td><td>标题以 REJECTED 开头</td><td>红色「该编号已作废，不再是有效 CVE」</td></tr>
     <tr><td>【等级】</td><td>源里能读到等级时</td><td>严重/高危红、低灰、中不着色，有分数时附 CVSS</td></tr>
     <tr><td>【标记】</td><td>在野利用 / 勒索条目</td><td>红色「已确认在野利用」「已知勒索团伙利用」</td></tr>
     <tr><td>【摘要翻译】</td><td>有译文且与原文不同</td><td>最多 300 字，超出以 … 结尾</td></tr>
@@ -341,6 +353,9 @@ def main(argv: list[str] | None = None) -> int:
     cards.append(render_card(
         compose(config, [demo["minimal"]], budget=budget)[0],
         "只有标题也能单独成一条", 'compose(...)[0]'))
+    cards.append(render_card(
+        compose(config, [demo["rejected"]], budget=budget)[0],
+        "CVE 撤稿通知（红色【撤销CVE】）", 'REJECTED_TITLE_PREFIX'))
 
     bulk_config, bulk = build_multipage(config)
     bulk_messages = compose(bulk_config, bulk, budget=budget)

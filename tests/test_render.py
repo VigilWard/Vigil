@@ -94,6 +94,20 @@ class TestRenderItem(unittest.TestCase):
         self.assertEqual(field_of(render_item(make_item(1, source_name="oss-security"), markup=False),
                                   "来源"), "oss-security")
 
+    def test_withdrawn_cve_is_marked(self):
+        """内核源的撤稿通知（REJECTED: CVE-…）要单独标出来，别被当成一条新漏洞。"""
+        item = make_item(1, title="REJECTED: CVE-2026-99252: io_uring/mpscq: disable preemption",
+                         cves=("CVE-2026-99252",))
+        self.assertIn("【撤销CVE】该编号已作废，不再是有效 CVE",
+                      render_item(item, markup=False).splitlines())
+
+    def test_rejected_prefix_is_case_insensitive(self):
+        item = make_item(1, title="rejected: CVE-2026-1111: x", cves=("CVE-2026-1111",))
+        self.assertIn("【撤销CVE】", render_item(item, markup=False))
+
+    def test_normal_item_has_no_withdrawn_field(self):
+        self.assertNotIn("【撤销CVE】", render_item(make_item(1), markup=False))
+
     def test_severity_line(self):
         item = make_item(1, cves=("CVE-2026-1111",), severity=4)
         self.assertIn("【等级】严重", render_item(item, markup=False))
@@ -189,6 +203,10 @@ class TestMarkup(unittest.TestCase):
         item = make_item(1)
         item.ransomware = True
         self.assertIn("<font color='red'>已知勒索团伙利用</font>", render_item(item))
+
+    def test_withdrawn_cve_is_red(self):
+        item = make_item(1, title="REJECTED: CVE-2026-99252: x", cves=("CVE-2026-99252",))
+        self.assertIn("<font color='red'>该编号已作废，不再是有效 CVE</font>", render_item(item))
 
     def test_exploited_is_red(self):
         self.assertIn("<font color='red'>已确认在野利用</font>",
@@ -293,6 +311,28 @@ class TestCompose(unittest.TestCase):
         self.assertEqual(message.template, "carmine")
         self.assertIn("【编号】CVE-2026-1111", message.body)
         self.assertIn("【等级】<font color='red'>严重（CVSS 9.8）</font>", message.body)
+
+    def test_header_prefers_translated_title(self):
+        """头部是扫消息时唯一会看的地方，有译文就该用译文。"""
+        item = make_item(1, title="Ivanti Connect Secure Authentication Bypass")
+        item.title_zh = "Ivanti Connect Secure 身份认证绕过"
+        self.assertEqual(compose(self.config, [item])[0].title,
+                         "Ivanti Connect Secure 身份认证绕过")
+
+    def test_header_keeps_icon_on_translated_title(self):
+        item = make_item(1, exploited=True)
+        item.title_zh = "中文标题"
+        self.assertEqual(compose(self.config, [item])[0].title, "🚨 中文标题")
+
+    def test_header_falls_back_when_translation_is_identical(self):
+        item = make_item(1, title="Same title")
+        item.title_zh = "Same title"
+        self.assertEqual(compose(self.config, [item])[0].title, "Same title")
+
+    def test_header_strips_cve_prefix_from_translated_title(self):
+        item = make_item(1, title="CVE-2026-1111: Foo", cves=("CVE-2026-1111",))
+        item.title_zh = "CVE-2026-1111: 中文标题"
+        self.assertEqual(compose(self.config, [item])[0].title, "中文标题")
 
     def test_exploited_uses_alarm_icon_and_red(self):
         item = make_item(1, exploited=True, severity=4)
