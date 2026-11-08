@@ -199,6 +199,11 @@ class TestPrivateHosts(ConfigCase):
                     mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}):
                 self._rejects({"sources": [{"name": "a", "url": url}]}, "云元数据")
 
+    def test_fullwidth_localhost_is_rejected(self):
+        """IDNA 会把全角主机名映射成 localhost，配置阶段就要拦住。"""
+        self._rejects({"sources": [{"name": "a", "url": "http://ｌｏｃａｌｈｏｓｔ/feed"}]},
+                      "私网")
+
 
 class TestJsonMappingValidation(ConfigCase):
     def test_empty_mapping_value_is_rejected(self):

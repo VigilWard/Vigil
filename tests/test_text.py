@@ -4,8 +4,9 @@ import time
 import unittest
 from datetime import datetime, timezone
 
-from vigil.parse import clean, cvss_of, parse_time, severity_of, shorten
-from vigil.render import shorten_bytes
+from vigil.models import shorten, shorten_bytes
+from vigil.parse import clean, parse_time
+from vigil.scoring import cvss_of, severity_of
 
 
 class TestClean(unittest.TestCase):
@@ -115,6 +116,21 @@ class TestClean(unittest.TestCase):
         """未闭合的 <script> 可能只是正文在讨论它，不能把后文整段吞掉；
         但后面成对的 <style> 仍然要剥掉。"""
         self.assertEqual(clean("<script>var a=1; <style>b{c}</style> 正文"), "var a=1; 正文")
+
+    def test_escaped_inline_tags_are_kept_as_text(self):
+        """正文在讲标签时（"Use &lt;b&gt; for bold"），不能把示例整段吃掉。"""
+        self.assertEqual(clean("Use &lt;b&gt; for bold"), "Use <b> for bold")
+        self.assertEqual(clean("Escaping &lt;script&gt; in templates"),
+                         "Escaping <script> in templates")
+
+    def test_escaped_structural_html_is_still_stripped(self):
+        """JSON 源常把整篇 HTML 转义：<p>/<div> 这类结构标签仍要剥掉。"""
+        self.assertEqual(clean("&lt;p&gt;foo&lt;/p&gt;"), "foo")
+        self.assertEqual(clean("&lt;div&gt;&lt;span&gt;bar&lt;/span&gt;&lt;/div&gt;"), "bar")
+
+    def test_escaped_comment_is_kept_as_text(self):
+        """注释在 unescape 之前就处理掉了；转义过的注释只是正文，不该被删。"""
+        self.assertIn("<!--", clean("A &lt;!-- note --&gt; here"))
 
 
 class TestShorten(unittest.TestCase):

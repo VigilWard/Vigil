@@ -1,6 +1,7 @@
 """HTTP 抓取：安全重定向、条件请求、限流重试、字节上限、编码嗅探。"""
 from __future__ import annotations
 
+import codecs
 import gzip
 import http.client
 import io
@@ -38,8 +39,10 @@ ACCEPT = (
     "text/xml;q=0.9, application/json;q=0.8, text/html;q=0.7, */*;q=0.5"
 )
 
-# 这些编码"永远不会解码失败"，一旦谎标就会静默产出乱码，必须放到最后
-_LOSSY_SINGLE_BYTE = {"iso-8859-1", "latin-1", "latin1", "cp1252", "windows-1252"}
+# 这些编码"永远不会解码失败"，一旦谎标就会静默产出乱码，必须放到最后。
+# 用 codecs 归一化后的名字：iso8859-1 / latin_1 / l1 都是同一个编码，
+# 只比字面字符串会漏掉 "iso8859-1" 这种同样常见的写法。
+_LOSSY_SINGLE_BYTE = frozenset({"iso8859-1", "cp1252"})
 # UTF-8 的各种写法；声明成这些时优先按 UTF-8 处理
 _UTF8_ALIASES = frozenset({"utf-8", "utf8", "utf_8", "utf-8-sig", "utf8mb4"})
 
@@ -52,17 +55,37 @@ class Response:
 
 
 def _origin(url: str) -> tuple[str, str, int]:
-    parts = urlsplit(url)
-    scheme = parts.scheme.lower()
+    parts, port = _split_url(url)
+    return parts.scheme.lower(), _ascii_host(parts.hostname or ""), port
+
+
+def _split_url(url: str):
+    """urlsplit + 端口校验；非法端口/畸形 IPv6 统一转成 FetchError。"""
     try:
+        parts = urlsplit(url)
         port = parts.port
-    except ValueError as exc:  # 非法端口
-        raise FetchError(f"地址端口非法：{url}") from exc
+    except ValueError as exc:
+        raise FetchError(f"url 无法解析：{exc}") from exc
     # 端口 0 是 falsy：以前 `port or 443` 会把 https://host:0/ 当成 443，
     # 真正的连接却打到 0，报错完全对不上。None 才是"没写端口"。
     if port is None:
-        port = 443 if scheme == "https" else 80
-    return scheme, (parts.hostname or "").lower(), port
+        port = 443 if parts.scheme.lower() == "https" else 80
+    return parts, port
+
+
+def _ascii_host(host: str) -> str:
+    """把主机名归一化成 ASCII 小写（IDNA），所有字面检查都用它。
+
+    全角/其它 Unicode 写法（例如 "ｌｏｃａｌｈｏｓｔ"）经 getaddrinfo 会按 IDNA
+    变成 "localhost"，但字面比较看不出来——不归一化，SSRF 的字面检查会被绕开。
+    """
+    host = (host or "").strip().rstrip(".")
+    if not host or host.isascii():
+        return host.lower()
+    try:
+        return host.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return host.lower()
 
 
 def allow_private_hosts() -> bool:
@@ -82,7 +105,7 @@ def is_blocked_host(host: str) -> bool:
     只做字面 IP 和常见本地域名判断；不做 DNS 解析，避免在重定向处理器里
     引入不可控的阻塞。真正的 DNS rebinding 仍需网络层 egress 策略兜底。
     """
-    host = (host or "").strip().lower().rstrip(".")
+    host = _ascii_host(host)
     if not host:
         return True
     if host in {"localhost", "localhost.localdomain", "metadata.google.internal", "metadata.goog"}:
@@ -100,6 +123,10 @@ def is_blocked_host(host: str) -> bool:
             address = ipaddress.ip_address(socket.inet_aton(host))
         except (OSError, UnicodeError):
             return False
+        except ValueError:
+            # 含 NUL 等非法字符时 inet_aton 抛的是 ValueError；这种主机名
+            # 不能被当成"可用的公网地址"，否则异常会一路逃出 fetch。
+            return True
     return not address.is_global
 
 
@@ -119,7 +146,7 @@ def is_metadata_address(host: str) -> bool:
     这类地址上没有任何正常的订阅源，所以**不受** `VIGIL_ALLOW_PRIVATE_HOSTS`
     影响：内网源配了开放跳转、或本身被攻破时，它就是云凭据泄露的入口。
     """
-    host = (host or "").strip().lower().rstrip(".")
+    host = _ascii_host(host)
     if not host:
         # 空主机名交给 is_blocked_host 处理，别在这里冒充"元数据地址"
         return False
@@ -133,13 +160,50 @@ def is_metadata_address(host: str) -> bool:
     except ValueError:
         try:
             address = ipaddress.ip_address(socket.inet_aton(host))
-        except (OSError, UnicodeError):
+        except (OSError, UnicodeError, ValueError):
             return False
     # `http://[::ffff:169.254.169.254]/` 和裸 IPv4 是同一个目标，但版本不同，
     # 直接比网段会漏掉；先拆出内嵌的 IPv4。
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
         address = address.ipv4_mapped
     return any(address in network for network in _METADATA_NETWORKS)
+
+
+def check_url(url: str) -> tuple[str, str, int]:
+    """校验地址的安全约束，返回 (scheme, host, port)；不合法时抛 ValueError。
+
+    配置校验和抓取入口共用这一份规则。以前两处各写一遍，已经跑偏：
+    配置拦用户名密码、抓取不拦；抓取拦 scheme、配置不拦（开了逃生门时
+    `file://` 会被真的打开）。消息直接拼进 ConfigError / FetchError，所以
+    这里只给原因，不带"第几个源"这类上下文。
+    """
+    try:
+        parts, port = _split_url(url)
+    except FetchError as exc:
+        raise ValueError(str(exc)) from exc
+    scheme = parts.scheme.lower()
+    host = _ascii_host(parts.hostname or "")
+    if scheme not in ("http", "https") or not host:
+        raise ValueError("url 必须是完整的 http/https 地址")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in url):
+        # 换行/控制字符会让 http.client 在发请求时才抛 ValueError，
+        # 也会把日志和卡片排版弄乱；在入口就拒绝。
+        raise ValueError("url 不能包含换行或控制字符")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("url 不应包含用户名或密码，请改用 Secrets 和请求头")
+    # 元数据地址必须先判：它连逃生门也不放行。放在私网判断之后会出现
+    # "请设置 VIGIL_ALLOW_PRIVATE_HOSTS=1"——用户照做后仍然被拒。
+    if is_metadata_address(host):
+        raise ValueError(
+            "url 指向云元数据或链路本地地址，已拒绝"
+            "（这类地址不受 VIGIL_ALLOW_PRIVATE_HOSTS 影响）"
+        )
+    if not allow_private_hosts() and is_blocked_host(host):
+        raise ValueError(
+            "url 指向本机或私网地址，已拒绝；"
+            "如果确实要抓内网源，请设置 VIGIL_ALLOW_PRIVATE_HOSTS=1"
+        )
+    return scheme, host, port
 
 
 def _resolves_to_blocked(host: str) -> bool:
@@ -268,6 +332,14 @@ def _forgiving_utf8(raw: bytes) -> str | None:
     return None
 
 
+def _canonical_encoding(name: str) -> str:
+    """把编码名归一化成 codecs 的标准名；不认识的返回空串。"""
+    try:
+        return codecs.lookup(name).name
+    except (LookupError, ValueError):
+        return ""
+
+
 def decode_bytes(raw: bytes, declared: str | None = None) -> str:
     """按 BOM > 声明编码 > UTF-8 > 常见编码 的顺序解码。
 
@@ -287,14 +359,18 @@ def decode_bytes(raw: bytes, declared: str | None = None) -> str:
     xml_encoding = xml.group(1).decode("ascii", "ignore").lower() if xml else ""
     charset = (declared or "").strip().strip("'\"").lower()
 
-    high_bytes = any(byte > 127 for byte in raw[:4096])
+    # 整篇扫一遍（bytes.isascii 是 C 实现，16MB 只要 1ms 级）：
+    # 只看前 4096 字节时，长 ASCII 前缀会把后面的 GBK 正文藏过去，
+    # 同一个响应换个偏移量就得到不同结果。
+    high_bytes = not raw.isascii()
     declared_encodings: list[str] = []
     for encoding in (xml_encoding, charset):
         if not encoding:
             continue
         # 头里写 latin-1 但正文有高位字节，八成是谎标：这种编码"永远能解码成功"，
         # 直接信它会静默产出乱码，所以跳过，交给后面的 UTF-8/GB18030 判断。
-        if encoding in _LOSSY_SINGLE_BYTE and high_bytes:
+        # 编码名先归一化：iso8859-1 / latin_1 / l1 都是同一个编码。
+        if _canonical_encoding(encoding) in _LOSSY_SINGLE_BYTE and high_bytes:
             continue
         if encoding not in declared_encodings:
             declared_encodings.append(encoding)
@@ -416,6 +492,10 @@ def _decompress(raw: bytes, encoding: str, deadline: float | None) -> bytes:
             # 传输被截断是可重试的，所以用 DecodeError 而不是 FetchError
             raise DecodeError(f"gzip 解压失败：{exc}") from exc
     if encoding == "deflate":
+        if not raw:
+            # 空响应体不是"被截断的 deflate 流"：gzip / identity 都按空内容处理，
+            # 这里保持一致，否则 200 + 空体 + deflate 的源每轮要白重试三次。
+            return b""
         try:
             return _inflate_limited(raw, deadline)
         except zlib.error:
@@ -498,18 +578,14 @@ def fetch(
                 continue
             request_headers[name] = value
 
-    # 初始地址也要过 SSRF 检查：以前只检查重定向，配置里写内网/元数据地址
-    # 会被直接抓取并可能随消息外带。内网源用 VIGIL_ALLOW_PRIVATE_HOSTS=1 放行；
-    # 云元数据/链路本地地址是唯一的例外，开了逃生门也不放行。
+    # 初始地址也要过安全检查：以前只检查重定向，配置里写内网/元数据地址
+    # 会被直接抓取并可能随消息外带。规则与 config 校验共用一份（check_url）。
+    # 内网源用 VIGIL_ALLOW_PRIVATE_HOSTS=1 放行；云元数据/链路本地地址是
+    # 唯一的例外，开了逃生门也不放行。
     try:
-        _, host, _ = _origin(url)
+        check_url(url)
     except ValueError as exc:
-        # urlsplit 对畸形 IPv6 等输入直接抛 ValueError，不能让它冒到 main。
-        raise FetchError(f"地址无法解析：{url}") from exc
-    if is_metadata_address(host):
-        raise FetchError(f"拒绝访问云元数据或链路本地地址：{host or url}")
-    if not allow_private_hosts() and is_blocked_host(host):
-        raise FetchError(f"拒绝访问本机或私网地址：{host or url}")
+        raise FetchError(str(exc)) from exc
 
     last_error = "未知错误"
     attempts = 0

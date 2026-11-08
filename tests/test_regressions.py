@@ -22,9 +22,10 @@ from unittest import mock
 import watch
 from tests.support import FakeResponse, http_error
 from vigil import feishu, net
-from vigil.app import _send_alerts, build_alerts, load_targets
-from vigil.collect import collect, merge
+from vigil.alerts import build_alerts, send_alerts
+from vigil.collect import collect
 from vigil.config import load_config
+from vigil.digest import compose, merge
 from vigil.models import (
     EMPTY_ALERT,
     FAIL_ALERT,
@@ -47,9 +48,11 @@ from vigil.models import (
     StateError,
 )
 from vigil.net import Response
-from vigil.parse import clean, cvss_of, parse_json, parse_nginx, parse_rss, parse_time, severity_of
-from vigil.render import compose, render_item, sanitize_link
+from vigil.parse import clean, parse_json, parse_nginx, parse_rss, parse_time
+from vigil.render import render_item, sanitize_link
+from vigil.scoring import cvss_of, severity_of
 from vigil.state import STATE_VERSION, State, load_state
+from vigil.targets import load_targets
 from vigil.translate import Provider, Translator
 
 # 固定时间戳，避免用例依赖真实时钟
@@ -285,19 +288,6 @@ class TestPendingDedup(unittest.TestCase):
         self.assertEqual(state.seen, {})
 
 
-class TestSeenCap(unittest.TestCase):
-    def test_seen_is_pruned_to_hard_limit(self):
-        """裁剪时跳过 pending 后没有补偿，实测 20005 条只删 0 条。"""
-        state = State()
-        now = int(time.time())
-        for index in range(MAX_SEEN + 5):
-            state.seen[f"k:{index}"] = "fp"
-            state.seen_at[f"k:{index}"] = now - 100
-        dropped, _ = state.prune(now)
-        self.assertLessEqual(len(state.seen), MAX_SEEN)
-        self.assertEqual(dropped, 5)
-
-
 class TestOverflowCounting(unittest.TestCase):
     def test_overflow_counts_real_items_only(self):
         """顺延条数必须等于"没发出去的条目数"，不能把标题之类的块算进去。"""
@@ -420,14 +410,14 @@ class TestStateVersion(unittest.TestCase):
 class TestWebhookConfig(unittest.TestCase):
     def test_object_without_webhook_is_rejected(self):
         """写了对象却没给地址，多半是复制漏了，不该静默跳过。"""
-        from vigil.app import load_targets
+        from vigil.targets import load_targets
         with mock.patch.dict(os.environ, {
             "FEISHU_WEBHOOK": "", "FEISHU_WEBHOOKS": '[{"secret": "x"}]',
         }), self.assertRaises(ConfigError):
             load_targets()
 
     def test_empty_items_are_ignored(self):
-        from vigil.app import load_targets
+        from vigil.targets import load_targets
         with mock.patch.dict(os.environ, {
             "FEISHU_WEBHOOK": "",
             "FEISHU_WEBHOOKS": "https://open.feishu.cn/hook/a,,",
@@ -435,37 +425,28 @@ class TestWebhookConfig(unittest.TestCase):
             self.assertEqual(len(load_targets()), 1)
 
     def test_invalid_json_is_rejected(self):
-        from vigil.app import load_targets
+        from vigil.targets import load_targets
         with mock.patch.dict(os.environ, {"FEISHU_WEBHOOK": "", "FEISHU_WEBHOOKS": "[{oops"}), \
                 self.assertRaises(ConfigError):
             load_targets()
 
     def test_non_array_json_is_rejected(self):
-        from vigil.app import load_targets
+        from vigil.targets import load_targets
         with mock.patch.dict(os.environ, {"FEISHU_WEBHOOK": "", "FEISHU_WEBHOOKS": '{"a": 1}'}), \
                 self.assertRaises(ConfigError):
             load_targets()
 
     def test_non_https_webhook_is_rejected(self):
-        from vigil.app import load_targets
+        from vigil.targets import load_targets
         with mock.patch.dict(os.environ, {
             "FEISHU_WEBHOOK": "http://open.feishu.cn/hook/a",
             "FEISHU_WEBHOOKS": "", "FEISHU_ALLOW_ANY_HOST": "",
         }), self.assertRaises(ConfigError):
             load_targets()
 
-    def test_non_feishu_host_is_rejected(self):
-        """不是飞书域名就必须显式打开 FEISHU_ALLOW_ANY_HOST，避免把消息发给第三方。"""
-        from vigil.app import load_targets
-        with mock.patch.dict(os.environ, {
-            "FEISHU_WEBHOOK": "https://evil.test/hook/a",
-            "FEISHU_WEBHOOKS": "", "FEISHU_ALLOW_ANY_HOST": "",
-        }), self.assertRaises(ConfigError):
-            load_targets()
-
     def test_shared_secret_applies_to_string_entries(self):
         """FEISHU_SECRET 是单目标写法的兼容路径，多目标的字符串项也应继承它。"""
-        from vigil.app import load_targets
+        from vigil.targets import load_targets
         with mock.patch.dict(os.environ, {
             "FEISHU_WEBHOOK": "",
             "FEISHU_WEBHOOKS": "https://open.feishu.cn/hook/a",
@@ -639,7 +620,7 @@ class TestFeishuRetryAfter(unittest.TestCase):
         self.assertIn(f"已尝试 {opener.call_count} 次", str(ctx.exception))
 
 
-class TestLinkSanitizing(unittest.TestCase):
+class TestLinkSanitizingRegression(unittest.TestCase):
     def test_link_markup_is_stripped(self):
         """链接也来自外部源：<font> / ** 这类字符必须剔除，否则能往卡片里注入样式。"""
         item = make_item()
@@ -671,7 +652,7 @@ class TestTitleSpacing(unittest.TestCase):
 class TestWebhookFallback(unittest.TestCase):
     def test_empty_array_falls_back_to_single(self):
         """FEISHU_WEBHOOKS 写了个 "[]" 时不能把 FEISHU_WEBHOOK 一起废掉。"""
-        from vigil.app import load_targets
+        from vigil.targets import load_targets
         with mock.patch.dict(os.environ, {
             "FEISHU_WEBHOOK": "https://open.feishu.cn/hook/a",
             "FEISHU_WEBHOOKS": "[]",
@@ -681,7 +662,7 @@ class TestWebhookFallback(unittest.TestCase):
 
     def test_only_separators_falls_back_to_single(self):
         """逗号/换行分隔但一个地址都没有，同样要回落。"""
-        from vigil.app import load_targets
+        from vigil.targets import load_targets
         with mock.patch.dict(os.environ, {
             "FEISHU_WEBHOOK": "https://open.feishu.cn/hook/a",
             "FEISHU_WEBHOOKS": " , \n , ",
@@ -689,7 +670,7 @@ class TestWebhookFallback(unittest.TestCase):
             self.assertEqual(len(load_targets()), 1)
 
     def test_separators_alone_yield_nothing(self):
-        from vigil.app import load_targets
+        from vigil.targets import load_targets
         with mock.patch.dict(os.environ, {"FEISHU_WEBHOOK": "", "FEISHU_WEBHOOKS": " , "}):
             self.assertEqual(load_targets(), [])
 
@@ -698,7 +679,7 @@ class TestAlertPerTarget(unittest.TestCase):
     """多群场景：一个群收到了，另一个群失败，失败的那个下一轮必须还能收到。"""
 
     def setUp(self):
-        from vigil.app import apply_alerts, build_alerts
+        from vigil.alerts import apply_alerts, build_alerts
         self.build = build_alerts
         self.apply = apply_alerts
         self.config = Config(sources=[Source("坏源", "https://a.test/1")])
@@ -708,15 +689,13 @@ class TestAlertPerTarget(unittest.TestCase):
         self.b = PushTarget("https://hook.test/b", "")
 
     def _send(self, fail_for: set[str]):
-        from vigil.app import _send_alerts
-
         def fake(text, target, *, deadline=None):
             if target.webhook in fail_for:
                 raise PushError("模拟失败")
 
         alerts = self.build(self.config, self.state, 1000, {self.a.tid, self.b.tid})
-        with mock.patch("vigil.app.send", fake):
-            ok, delivered = _send_alerts([self.a, self.b], alerts, 1e9)
+        with mock.patch("vigil.alerts.send", fake):
+            ok, delivered = send_alerts([self.a, self.b], alerts, 1e9)
         return alerts, ok, delivered
 
     def test_failed_target_gets_it_next_round(self):
@@ -1078,18 +1057,10 @@ class TestConfigAndStateEncoding(unittest.TestCase):
             self.assertTrue(State().save(path))
             self.assertEqual(load_state(path).seen, {})
 
-    def test_invalid_saved_at_is_a_state_error(self):
-        with TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state.json"
-            path.write_text(json.dumps({"version": STATE_VERSION, "saved_at": "x"}),
-                            encoding="utf-8")
-            with self.assertRaises(StateError):
-                load_state(path)
-
     def test_nan_in_state_is_a_state_error(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
-            path.write_text('{"version": 2, "saved_at": NaN}', encoding="utf-8")
+            path.write_text('{"version": 2, "heartbeat": NaN}', encoding="utf-8")
             with self.assertRaises(StateError):
                 load_state(path)
 
@@ -1246,8 +1217,8 @@ class TestAlertChunking(unittest.TestCase):
         def fake(text, target, *, deadline=None):
             texts.append(text)
 
-        with mock.patch("vigil.app.send", fake):
-            ok, delivered = _send_alerts([target], alerts, 1e9)
+        with mock.patch("vigil.alerts.send", fake):
+            ok, delivered = send_alerts([target], alerts, 1e9)
         self.assertTrue(ok)
         self.assertGreaterEqual(len(texts), 2)
         self.assertTrue(all(len(text.encode("utf-8")) <= MAX_TEXT_BYTES for text in texts))
@@ -1265,15 +1236,15 @@ class TestAlertChunking(unittest.TestCase):
                 raise PushError("模拟失败")
             texts.append(text)
 
-        with mock.patch("vigil.app.send", fake):
-            ok, delivered = _send_alerts([target], alerts, 1e9)
+        with mock.patch("vigil.alerts.send", fake):
+            ok, delivered = send_alerts([target], alerts, 1e9)
         self.assertFalse(ok)
         self.assertGreater(len(delivered), 0)
         self.assertLess(len(delivered), len(alerts))
 
     def test_oversized_single_alert_is_truncated(self):
         """单条告警超过纯文本预算时要截断，不能把超长消息发给飞书。"""
-        from vigil.app import Alert, _alert_chunks
+        from vigil.alerts import Alert, _alert_chunks
 
         alert = Alert("fail", "k", "x" * 500, set())
         chunks = list(_alert_chunks([alert], 100))
@@ -1331,6 +1302,7 @@ class TestSecretWhitespace(unittest.TestCase):
 
 class TestWebhookHost(unittest.TestCase):
     def test_non_feishu_host_is_rejected(self):
+        """不是飞书域名就必须显式打开 FEISHU_ALLOW_ANY_HOST，避免把消息发给第三方。"""
         with mock.patch.dict(os.environ, {
             "FEISHU_WEBHOOK": "https://hook.test/a",
             "FEISHU_WEBHOOKS": "",

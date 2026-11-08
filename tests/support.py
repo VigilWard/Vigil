@@ -17,9 +17,6 @@ class FakeResponse:
     def read(self, size=None):
         return self._body.read(size)
 
-    def getheaders(self):
-        return list(self.headers.items())
-
     def __enter__(self):
         return self
 

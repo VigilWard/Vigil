@@ -76,6 +76,16 @@ class TestPersistence(StateCase):
         with self.assertRaises(StateError):
             load_state(self.path)
 
+    def test_legacy_saved_at_is_dropped_on_next_save(self):
+        """saved_at 是已删除的死字段：旧 state 仍能读，下次写入就不再带它。"""
+        self.path.write_text(json.dumps(
+            {"version": STATE_VERSION, "saved_at": 123, "seen": {"k:1": "fp"}}
+        ), encoding="utf-8")
+        state = load_state(self.path)
+        self.assertTrue(state.save(self.path))
+        self.assertNotIn("saved_at", json.loads(self.path.read_text(encoding="utf-8")))
+        self.assertFalse(state.save(self.path))      # 之后不再重复写
+
 
 class TestDedup(StateCase):
     def test_new_item_is_fresh(self):
@@ -272,7 +282,7 @@ class TestAlertBookkeeping(StateCase):
 
 class TestTimestampValidation(StateCase):
     def _load(self, **sections):
-        raw = {"version": 2, "saved_at": 0, "heartbeat": 0,
+        raw = {"version": 2, "heartbeat": 0,
                "sources": {}, "seen": {}, "seen_at": {}, "pending": {}}
         raw.update(sections)
         self.path.write_text(json.dumps(raw), encoding="utf-8")
@@ -330,7 +340,7 @@ class TestNonFiniteNumbers(StateCase):
 
     def test_overflowing_float_at_top_level(self):
         with self.assertRaises(StateError) as ctx:
-            self._load_text('{"version": 2, "saved_at": 1e400}')
+            self._load_text('{"version": 2, "heartbeat": 1e400}')
         self.assertIn("非有限", str(ctx.exception))
 
     def test_overflowing_float_in_seen_at(self):

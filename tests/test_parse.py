@@ -7,7 +7,7 @@ from email.utils import format_datetime
 from unittest import mock
 
 from vigil.models import Item, ParseError, Source
-from vigil.parse import parse_json, parse_kev, parse_nginx, parse_rss
+from vigil.parse import build_item, parse_json, parse_kev, parse_nginx, parse_rss
 
 SRC = Source("测试源", "https://example.test/feed.xml")
 
@@ -254,6 +254,31 @@ class TestNginx(unittest.TestCase):
         with self.assertRaises(ParseError):
             parse_nginx("<html><body>nothing</body></html>", self._src())
 
+    def test_uppercase_markup_is_accepted(self):
+        """HTML 标签名不区分大小写：模板改成 <LI>/<P> 不能整源判"结构变了"。"""
+        html = "<UL><LI><P>Buffer overflow<br>Severity: high<br>CVE-2026-1111</P></LI></UL>"
+        self.assertEqual(parse_nginx(html, self._src())[0].title, "Buffer overflow")
+
+    def test_cvss_on_severity_line_is_kept(self):
+        """Severity 行会从摘要里剔掉，分数必须从原始段落读，否则整行 CVSS 丢失。"""
+        html = ("<ul><li><p>Buffer overflow<br>Severity: high CVSS 9.8<br>"
+                "Vulnerable: 1.0-1.2</p></li></ul>")
+        item = parse_nginx(html, self._src())[0]
+        self.assertEqual((item.severity, item.cvss), (3, 9.8))
+        self.assertNotIn("CVSS", item.summary)
+
+    def test_many_unclosed_anchors_stay_linear(self):
+        """回归锚点：10 个 20KB 块、每块 6600 个未闭合 <a>。
+
+        线性实现约 50ms；退回 `(.*?)</a>` 后每个 <a> 都要扫到块尾，
+        实测超过 4 秒（16MB 的错误页足以把整轮钉死）。
+        """
+        block = "<li><p>{title}<br>Severity: high<br>" + "<a>" * 6600 + "</p></li>"
+        page = "<ul>" + "".join(block.format(title=f"T{i}") for i in range(10)) + "</ul>"
+        started = time.perf_counter()
+        self.assertEqual(len(parse_nginx(page, self._src())), 10)
+        self.assertLess(time.perf_counter() - started, 1.0)
+
 
 class TestRssEntities(unittest.TestCase):
     def test_entity_text_inside_cdata_is_not_a_bomb(self):
@@ -350,6 +375,13 @@ class TestEntityScan(unittest.TestCase):
 
 class TestStructureGuards(unittest.TestCase):
     """源站改版时宁可报错（触发告警），也不能静默返回空。"""
+
+    def test_title_that_is_only_an_escaped_tag_is_not_dropped(self):
+        """标题写成 &lt;b&gt; 时它是文字而不是标签，不能因此丢掉整条公告。"""
+        item = build_item(SRC, uid="1", title="&lt;b&gt;")
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item.title, "<b>")
 
     def test_empty_response_is_an_error(self):
         with self.assertRaises(ParseError):

@@ -79,7 +79,7 @@ MAX_SUMMARY_CHARS = 300
 MAX_LINK_CHARS = 600
 MAX_UID_CHARS = 512
 # 源名会进卡片分组标题、状态告警和 state；限制长度，避免一个超长名字
-# 把告警正文撑爆（_send_alerts 按 18KB 分块，但单条告警仍应保持短小）。
+# 把告警正文撑爆（send_alerts 按 18KB 分块，但单条告警仍应保持短小）。
 MAX_NAME_CHARS = 80
 # 单个源的原始文本上限，超过就截断。摘要最终只展示 300 字，没必要为
 # 几十万字的 HTML 做十几次正则替换——那是白烧 CPU，也是拒绝服务的入口。
@@ -388,6 +388,26 @@ class Report:
     skipped: list[Failure] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class Message:
+    """一条待发送的飞书消息。标题、副标题进卡片头部，正文进卡片 body。
+
+    放在 models 而不是 render：render 负责"一条公告 → 正文"，digest 负责
+    "若干条目 → 若干消息"，feishu 负责"消息 → 请求体"。三方都只依赖这个
+    数据结构，不互相依赖。
+    """
+
+    title: str
+    subtitle: str
+    body: str
+    keys: list[str] = field(default_factory=list)
+    template: str = "blue"
+
+    def as_text(self) -> str:
+        head = f"{self.title} · {self.subtitle}" if self.subtitle else self.title
+        return f"{head}\n{self.body}" if self.body else head
+
+
 def _write(text: str, stream) -> None:
     """写一行；终端编码撑不住时（例如 Windows 的 GBK 控制台）降级成可编码字符。
 
@@ -436,3 +456,24 @@ def shorten(text: str, limit: int) -> str:
     if limit == 1:
         return text[:1]
     return text[: limit - 1] + "…"
+
+
+def shorten_bytes(text: str, budget: int) -> str:
+    """按 UTF-8 字节截断，不会切出半个汉字。
+
+    消息正文、状态告警都按字节算预算（飞书的限制是请求体字节数），
+    所以和按字截断的 shorten() 分开放。
+    """
+    if budget <= 0:
+        return ""
+    raw = text.encode("utf-8", "replace")
+    if len(raw) <= budget:
+        return text
+    if budget <= 3:
+        return raw[:budget].decode("utf-8", "ignore")
+    cut = raw[: budget - 3].decode("utf-8", "ignore")
+    if not cut:
+        # 预算连一个汉字都放不下（4~5 字节）：宁可不要省略号，
+        # 也不能把整段内容换成一个"…"。
+        return raw[:budget].decode("utf-8", "ignore")
+    return cut + "…"

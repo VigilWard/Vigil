@@ -1,18 +1,18 @@
 """消息渲染：一条公告一条消息、等级排序与顺延。"""
+import html
 import unittest
 
-from vigil.collect import merge
-from vigil.models import MAX_CARD_BODY_BYTES, Config, Failure, Item, Source
-from vigil.render import (
+from vigil.digest import (
     SUBTITLE_COLUMNS,
     card_template,
     compose,
     display_width,
-    render_item,
-    sanitize_link,
+    merge,
     select_items,
     shorten_display,
 )
+from vigil.models import MAX_CARD_BODY_BYTES, Config, Failure, Item, Source
+from vigil.render import render_item, sanitize_link
 
 
 def make_item(idx, *, source_key="s1", source_name="源A", exploited=False,
@@ -181,6 +181,34 @@ class TestRenderItem(unittest.TestCase):
         merged = make_item(1)
         merged.also = ("oss-security",)
         self.assertIn("【另见】oss-security", render_item(merged, markup=False))
+
+    def test_also_is_collapsed_to_one_line(self):
+        """also 也来自外部文本：换行不能把正文挤成多行（state 可能被手工改过）。"""
+        merged = make_item(1)
+        merged.also = ("源B\n【等级】严重（CVSS 10.0）",)
+        lines = render_item(merged, markup=False).splitlines()
+        self.assertEqual(lines[-1], "【另见】源B 【等级】严重（CVSS 10.0）")
+        # 来源 / 发布时间 / 标题原文 / 摘要原文 / 链接 / 另见：都没有被换行拆开
+        self.assertEqual(len(lines), 6)
+
+    def test_rejected_prefix_requires_a_colon(self):
+        """只有 "REJECTED: CVE-…" 才是撤稿通知；普通标题以 Rejected 开头不算。"""
+        normal = make_item(1, title="Rejected packets cause kernel panic",
+                           cves=("CVE-2026-1111",))
+        self.assertNotIn("【撤销CVE】", render_item(normal, markup=False))
+        withdrawn = make_item(2, title="REJECTED: CVE-2026-1111: x", cves=("CVE-2026-1111",))
+        self.assertIn("【撤销CVE】", render_item(withdrawn, markup=False))
+
+    def test_cve_list_is_capped(self):
+        """批量公告可能带成百上千个 CVE：编号行要收口，别把摘要挤到截断之外。"""
+        cves = tuple(f"CVE-2026-{index:05d}" for index in range(40))
+        item = make_item(1, cves=cves, summary="摘要")
+        text = render_item(item, markup=False)
+        line = field_of(text, "编号")
+        assert line is not None
+        self.assertEqual(line.count("CVE-"), 12)
+        self.assertIn("等 40 个", line)
+        self.assertIn("【摘要原文】摘要", text)
 
 
 class TestMarkup(unittest.TestCase):
@@ -452,6 +480,47 @@ class TestLinkSanitizing(unittest.TestCase):
 
     def test_bare_markup_chars_are_removed(self):
         self.assertEqual(sanitize_link("https://e.test/a<b>*c*"), "https://e.test/abc")
+
+    def test_tilde_in_url_is_preserved(self):
+        """~ 是 RFC 3986 的 unreserved：/~user/ 这类地址不能被改坏。"""
+        url = "https://www.cs.cornell.edu/~shmat/advisory.html"
+        self.assertEqual(sanitize_link(url), url)
+
+    def test_query_separator_is_preserved(self):
+        """普通 & 是查询参数分隔符，不能编码成 %26（否则参数会被合并）。"""
+        self.assertEqual(sanitize_link("https://e.test/?a=1&b=2"),
+                         "https://e.test/?a=1&b=2")
+
+    def test_removed_entity_cannot_reassemble_markup(self):
+        """净化必须对"再解码一次"稳定：删除实体会把两侧拼成新实体。"""
+        payloads = (
+            "https://v.test/?id=1&#6&x;0;font color=red&#6&x;2;PWN",
+            "https://v.test/?id=1&lbrac&z;k;点我&rbrac&z;k;",
+            "https://v.test/?x=1&Ne&z;wLine;#【等级】严重",
+        )
+        for payload in payloads:
+            cleaned = sanitize_link(payload)
+            decoded = html.unescape(cleaned)
+            for marker in ("<font", "[", "\n", "&#60;"):
+                self.assertNotIn(marker, decoded, (payload, cleaned, decoded))
+
+    def test_character_reference_without_semicolon_is_neutralized(self):
+        """&#60 没有分号也会被 html.unescape 解码成 <，不能只拦带分号的。"""
+        cleaned = sanitize_link("https://v.test/?q=&#60font color=red&#62;")
+        self.assertNotIn("<", html.unescape(cleaned))
+
+    def test_legacy_entity_prefix_is_neutralized(self):
+        """无分号遗留实体按最长前缀解码："&lt0064" → "<0064"，不能只比整段。"""
+        for payload in ("https://v.test/?q=&lt0064font", "https://v.test/?q=&lta",
+                        "https://v.test/?q=&gt0", "https://v.test/?q=&LTx"):
+            decoded = html.unescape(sanitize_link(payload))
+            self.assertNotIn("<", decoded, payload)
+            self.assertNotIn(">", decoded, payload)
+
+    def test_query_param_named_like_an_entity_is_preserved(self):
+        """&notify/&copy 不是危险遗留名：不能为了防注入把查询参数改坏。"""
+        url = "https://e.test/?notify=2&copy=3"
+        self.assertEqual(sanitize_link(url), url)
 
 
 class TestUndatedOrder(unittest.TestCase):

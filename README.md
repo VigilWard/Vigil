@@ -250,6 +250,8 @@ python watch.py --dry-run
 
 它会按你的真实基线算出「下一轮会推什么」并完整打印，不发送、不改基线。
 队列里上一轮没送达的条目也会一起列出来（会额外打一行提示）。
+还没有基线的源会单独列一段，标注「首次真实运行只建基线、不会推送」——
+它们不计入「本轮会发 N 条」，免得预览和真跑对不上。
 源抓取失败或被预算跳过时，预览也会逐条打印「⚠ …」；即使本轮没有可推送条目，
 这些提示也不会被省略。
 
@@ -546,16 +548,20 @@ state 格式与旧版不兼容（只支持一个 `state.json`）。第一次运�
 ```
 watch.py                 CLI 入口
 vigil/
-  models.py              常量、数据类型、异常、日志
+  models.py              常量、共享数据类型（Item/Source/Message 等）、异常、日志
   config.py              config.json 校验
-  net.py                 HTTP：重试、条件请求、字节上限、安全重定向、编码嗅探
+  net.py                 HTTP：重试、条件请求、字节上限、安全重定向、编码嗅探、URL 安全校验
   parse.py               文本清洗 + RSS/KEV/JSON/nginx 解析器
+  scoring.py             CVSS 分数与严重等级提取
   state.py               基线、内容指纹、待送达队列、原子写
-  render.py              消息渲染：一条公告一条消息、等级排序与顺延
+  render.py              单条公告 → 消息正文（字段排版、转义、链接净化）
+  digest.py              跨源合并、排序限额、副标题与头部配色（若干条目 → 若干消息）
   feishu.py              飞书签名、卡片封装与推送
-  collect.py             抓取编排与跨源合并
+  alerts.py              源健康告警的判定、分块与按目标记账
+  targets.py             飞书 webhook 目标解析与校验
+  collect.py             抓取编排：逐源调度、健康记账、去重、翻译、入队
   translate.py           标题/摘要英译中（Google / 百度 / MyMemory 自动降级，可选）
-  app.py                 命令行与一轮运行的编排
+  app.py                 命令行、一轮运行的编排与送达
 tests/                   单元测试 + 端到端状态机测试
   test_regressions.py    按缺陷归档的回归用例（编码损坏、预算耗尽、多群记账等）
   test_tools.py          tools/ 脚本的行为（依赖检查忽略虚拟环境等）

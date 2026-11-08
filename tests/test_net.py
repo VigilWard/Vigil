@@ -212,6 +212,10 @@ class TestDeflateIntegrity(unittest.TestCase):
         raw = engine.compress(b"") + engine.flush()
         self.assertEqual(net._decompress(raw, "deflate", None), b"")
 
+    def test_empty_body_with_deflate_is_empty(self):
+        """空响应体不是"截断的 deflate 流"：gzip/identity 都按空内容处理。"""
+        self.assertEqual(net._decompress(b"", "deflate", None), b"")
+
     def test_raw_stream_with_trailing_data_is_rejected(self):
         """raw 流带尾随字节正好是随机字节误判的形态；RFC1951 没有校验和可依。"""
         engine = zlib.compressobj(9, zlib.DEFLATED, -15)
@@ -223,8 +227,11 @@ class TestDeflateIntegrity(unittest.TestCase):
         """坏数据必须走 DecodeError 重试；以前 raw 回退会把它当成功（只请求 1 次）。"""
         payload = bytes.fromhex(
             "b3035c49cd23480f2e6ec0d6e8ae50bd9fa62b1a4f5019298be2d9f8e2d48b6e")
-        response = FakeResponse(payload, {"Content-Encoding": "deflate"})
-        with mock.patch("vigil.net.open_url", return_value=response) as opener, \
+        # 每次都要给一个新的响应对象：FakeResponse 的 BytesIO 读一次就空了，
+        # 复用会让第二次重试读到空 body（那是合法空响应，不会触发重试）。
+        responses = [FakeResponse(payload, {"Content-Encoding": "deflate"})
+                     for _ in range(net.HTTP_RETRIES)]
+        with mock.patch("vigil.net.open_url", side_effect=responses) as opener, \
                 mock.patch("time.sleep"), self.assertRaises(FetchError):
             net.fetch("https://a.test/x")
         self.assertEqual(opener.call_count, 3)
@@ -443,6 +450,54 @@ class TestPrivateHost(unittest.TestCase):
         with mock.patch.dict("os.environ", {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}), \
                 mock.patch("vigil.net.open_url", lambda *a, **k: response):
             self.assertEqual(net.fetch("http://127.0.0.1/feed").text, "ok")
+
+
+class TestUrlGuard(unittest.TestCase):
+    """配置校验和抓取入口共用 check_url：两处规则不能跑偏。"""
+
+    def test_check_url_rejects_non_http_scheme(self):
+        for url in ("file:///etc/passwd", "ftp://a.test/x", "data:text/plain,x"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                net.check_url(url)
+
+    def test_escape_hatch_does_not_allow_file_scheme(self):
+        """逃生门是给内网源用的，不能顺手把 file:// 放进来。"""
+        with mock.patch.dict(os.environ, {"VIGIL_ALLOW_PRIVATE_HOSTS": "1"}), \
+                mock.patch("vigil.net.open_url", side_effect=AssertionError("不应打开")) as opener, \
+                self.assertRaises(FetchError):
+            net.fetch("file:///C:/Windows/win.ini")
+        opener.assert_not_called()
+
+    def test_fullwidth_localhost_is_blocked(self):
+        """IDNA 会把全角主机名映射成 localhost；字面检查必须先归一化。"""
+        with self.assertRaises(ValueError):
+            net.check_url("http://ｌｏｃａｌｈｏｓｔ/feed")
+
+    def test_userinfo_is_rejected_by_fetch(self):
+        with mock.patch("vigil.net.open_url", side_effect=AssertionError("不应请求")) as opener, \
+                self.assertRaises(FetchError):
+            net.fetch("https://user:pass@a.test/x")
+        opener.assert_not_called()
+
+    def test_nul_host_is_blocked_instead_of_raising(self):
+        """inet_aton 对含 NUL 的主机名抛 ValueError，不能让异常逃出 fetch。"""
+        self.assertTrue(net.is_blocked_host("local\x00host"))
+
+
+class TestDecodeAliases(unittest.TestCase):
+    """编码名先归一化再比对；高位字节要在整篇里找。"""
+
+    TEXT = "这是一个包含中文的安全公告标题"
+
+    def test_alias_without_hyphen_is_treated_as_latin1(self):
+        raw = self.TEXT.encode("utf-8")
+        for declared in ("iso8859-1", "latin_1", "L1"):
+            with self.subTest(declared=declared):
+                self.assertEqual(net.decode_bytes(raw, declared), self.TEXT)
+
+    def test_high_bytes_are_found_past_the_first_4k(self):
+        raw = b"a" * 5000 + self.TEXT.encode("gbk")
+        self.assertEqual(net.decode_bytes(raw, "iso-8859-1"), "a" * 5000 + self.TEXT)
 
 
 class TestFetchBudget(unittest.TestCase):

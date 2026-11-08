@@ -18,7 +18,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from vigil.app import build_alerts, sample_message  # noqa: E402
+from vigil.alerts import build_alerts  # noqa: E402
+from vigil.app import sample_message  # noqa: E402
+from vigil.digest import compose  # noqa: E402
 from vigil.feishu import card_of  # noqa: E402
 from vigil.models import (  # noqa: E402
     CST,
@@ -28,7 +30,6 @@ from vigil.models import (  # noqa: E402
     Item,
     Source,
 )
-from vigil.render import compose  # noqa: E402
 from vigil.state import State  # noqa: E402
 
 # 飞书卡片头部模板色的近似值

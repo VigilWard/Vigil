@@ -172,7 +172,6 @@ class State:
         self.seen: dict[str, str] = {}
         self.seen_at: dict[str, int] = {}
         self.pending: dict[str, Pending] = {}
-        self.saved_at: int = 0
         self.heartbeat: int = 0
         self._pruned = False
         self._seq = 0
@@ -374,7 +373,6 @@ class State:
     def to_dict(self) -> dict:
         return {
             "version": STATE_VERSION,
-            "saved_at": self.saved_at,
             "heartbeat": self.heartbeat,
             "sources": {key: health.to_dict() for key, health in self.sources.items()},
             "seen": dict(self.seen),
@@ -395,7 +393,6 @@ class State:
             )
 
         state = cls()
-        state.saved_at = _as_stamp(raw.get("saved_at", 0), "state.saved_at")
         state.heartbeat = _as_stamp(raw.get("heartbeat", 0), "state.heartbeat")
         sources = raw.get("sources", {})
         if not isinstance(sources, dict):
@@ -453,7 +450,6 @@ class State:
             self.heartbeat = now
 
         payload = self.to_dict()
-        payload.pop("saved_at", None)
 
         previous = None
         if path.exists():
@@ -461,13 +457,9 @@ class State:
                 previous = json.loads(path.read_text(encoding="utf-8-sig"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 previous = None
-        if isinstance(previous, dict):
-            previous.pop("saved_at", None)
-            if previous == payload:
-                return False
+        if isinstance(previous, dict) and previous == payload:
+            return False
 
-        self.saved_at = now
-        payload["saved_at"] = now
         text = dump_json(payload, indent=None) + "\n"
         # 临时文件名带 pid：同一份 checkout 上并发跑两个 watch.py 时，固定名字
         # 会让先完成的一方把 tmp 换走，另一方的 fd 仍在写已经上线的 state.json。

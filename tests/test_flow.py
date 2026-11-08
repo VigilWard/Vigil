@@ -45,7 +45,7 @@ class FlowCase(unittest.TestCase):
         self.webhook = "https://hook.test/a"
         patches: list = [
             mock.patch("vigil.collect.fetch", self._fetch),
-            mock.patch("vigil.app.send", self._send),
+            mock.patch("vigil.alerts.send", self._send),
             mock.patch("vigil.app.send_card", self._send_card),
             mock.patch.dict(os.environ, {
                 "FEISHU_WEBHOOK": self.webhook,
@@ -147,6 +147,17 @@ class TestBasics(FlowCase):
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(self.run_main("--dry-run"), 0)
         self.assertIn("没有需要推送的新条目", output.getvalue())
+
+    def test_dry_run_does_not_count_a_new_source_as_sending(self):
+        """新源首次真实运行只建基线：预览不能说"本轮会发 N 条"再打自己的脸。"""
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.run_main("--dry-run"), 0)
+        text = output.getvalue()
+        self.assertIn("本轮会发 0 条消息", text)
+        self.assertIn("只建基线", text)
+
+        self.assertEqual(self.run_main(), 0)      # 真实运行：只建基线
+        self.assertEqual(self.posts, [])
 
     def test_dry_run_reports_skipped_sources(self):
         """全被预算跳过时 items 为空，预览也必须说明"本轮未检查"。"""
@@ -449,6 +460,39 @@ class TestAlertTruthfulness(FlowCase):
         self.assertEqual(self.state_path.read_bytes(), before)
         self.assertEqual(next(iter(self.state()["sources"].values()))["fail"], 3)
 
+    def test_failed_recovery_does_not_allow_a_false_one_next_round(self):
+        """恢复通知没发出去时，下一轮源又失败一次，不能补发"已恢复正常"。"""
+        self.run_main()
+        self.mode = "fail"
+        for _ in range(3):
+            self.run_main()
+        self.assertEqual(len(self.posts), 1)          # 首次 fail 告警
+
+        # 源恢复了，但这一轮告警发送失败 → 记账必须保留
+        self.mode = "ok"
+        with mock.patch("vigil.alerts.send", side_effect=PushError("boom")):
+            self.assertEqual(self.run_main(), 1)
+
+        # 下一轮源又失败一次（fail=1，未到阈值）：不能补发"已恢复"
+        self.mode = "fail"
+        self.assertEqual(self.run_main(), 0)
+        self.assertNotIn("已恢复正常", "\n".join(self.posts))
+
+    def test_skipped_round_is_not_reported_as_recovery(self):
+        """被时间预算跳过的一轮根本没检查，不能据此说源已恢复。"""
+        self.run_main()
+        self.mode = "fail"
+        for _ in range(3):
+            self.run_main()
+
+        self.mode = "ok"
+        with mock.patch("vigil.alerts.send", side_effect=PushError("boom")):
+            self.run_main()                           # 恢复通知没发出去
+
+        with mock.patch("vigil.app.FETCH_BUDGET", 0):
+            self.assertEqual(self.run_main(), 0)      # 这一轮被跳过（skipped=1）
+        self.assertNotIn("已恢复正常", "\n".join(self.posts))
+
     def test_removed_target_does_not_leave_items_stuck(self):
         """目标群被删掉后，已满足当前目标集合的记录要当场转正，不能等 7 天 TTL。"""
         second = "https://hook.test/b"
@@ -558,7 +602,7 @@ class TestAlertDelivery(FlowCase):
         self.mode = "fail"
         self.run_main()
         self.run_main()
-        with mock.patch("vigil.app.send", side_effect=PushError("boom")):
+        with mock.patch("vigil.alerts.send", side_effect=PushError("boom")):
             self.assertEqual(self.run_main(), 1)
 
     def test_test_mode_without_webhook(self):
@@ -571,6 +615,13 @@ class TestTestMode(FlowCase):
         self.assertEqual(self.run_main("--test"), 0)
         self.assertEqual(len(self.posts), 1)
         self.assertIn("测试消息", self.posts[0])
+
+    def test_test_mode_card_uses_the_real_layout(self):
+        """示例正文由 render_item 生成：字段增删时测试卡片会自动跟上。"""
+        self.assertEqual(self.run_main("--test"), 0)
+        for label in ("【来源】", "【编号】", "【发布时间】", "【标题翻译】", "【标题原文】",
+                      "【等级】", "【标记】", "【摘要翻译】", "【摘要原文】", "【链接】"):
+            self.assertIn(label, self.posts[0])
 
 
 class TestTranslation(FlowCase):

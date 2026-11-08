@@ -5,8 +5,17 @@ from unittest import mock
 
 from tests.support import FakeResponse, http_error
 from vigil import feishu
-from vigil.models import MAX_CARD_BODY_BYTES, Config, Item, PushError, PushTarget, Source
-from vigil.render import Message, compose
+from vigil.digest import compose
+from vigil.models import (
+    MAX_CARD_BODY_BYTES,
+    Config,
+    FetchError,
+    Item,
+    Message,
+    PushError,
+    PushTarget,
+    Source,
+)
 
 TARGET = PushTarget("https://open.feishu.cn/open-apis/bot/v2/hook/xxx", "my-secret")
 
@@ -130,6 +139,39 @@ class TestResponseHandling(unittest.TestCase):
                 self.assertRaises(PushError) as ctx:
             feishu.send("hi", TARGET)
         self.assertIn("sign match fail", str(ctx.exception))
+
+    def test_oversized_response_is_not_retried(self):
+        """响应体超限是确定性失败：重试三次只是白下载三遍。"""
+        with mock.patch("vigil.net.open_url", return_value=FakeResponse(b"")), \
+                mock.patch("vigil.net.read_limited",
+                           side_effect=FetchError("响应超过上限")) as reader, \
+                self.assertRaises(PushError):
+            feishu.send("hi", TARGET)
+        self.assertEqual(reader.call_count, 1)
+
+    def test_retry_after_is_capped_without_deadline(self):
+        """没有 deadline 时也要受单次等待上限约束，不能真的睡两分钟。"""
+        error = http_error(429, {"Retry-After": "120"})
+        waits: list[float] = []
+        with mock.patch("vigil.net.open_url", side_effect=error) as opener, \
+                mock.patch("time.sleep", side_effect=waits.append), \
+                self.assertRaises(PushError) as ctx:
+            feishu.send("hi", TARGET)
+        self.assertEqual(opener.call_count, 1)
+        self.assertEqual(waits, [])
+        self.assertIn("超过单次等待上限", str(ctx.exception))
+
+    def test_read_timeout_is_not_retried(self):
+        """请求已发出、读响应超时：飞书可能已投递，重试只会多刷卡片。"""
+        class BrokenRead(FakeResponse):
+            def read(self, size=None):
+                raise TimeoutError("read timed out")
+
+        with mock.patch("vigil.net.open_url", return_value=BrokenRead(b"")), \
+                mock.patch("time.sleep") as sleeper, self.assertRaises(PushError) as ctx:
+            feishu.send("hi", TARGET)
+        self.assertIn("已发出", str(ctx.exception))
+        sleeper.assert_not_called()
 
 
 class TestCard(unittest.TestCase):

@@ -27,6 +27,7 @@ from .models import (
     sanitize_text,
     shorten,
 )
+from .scoring import cvss_of, severity_of
 
 CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,8}", re.I)
 
@@ -78,6 +79,14 @@ _SPACES = re.compile(r"\s+")
 # 邮件列表类 feed 的固定前缀："Posted by Foo Bar on Oct 31 "
 _POSTED_BY = re.compile(
     r"^Posted by .{0,80}? on (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+",
+    re.I,
+)
+# 判断"这段文字其实是整篇 HTML"用的结构标签。只认块级/结构标签，不认
+# <b>/<i>/<code>/<a>：公告正文里讨论这些行内标签是常态，把示例删掉会丢内容。
+_STRUCTURAL_TAG = re.compile(
+    r"</?(?:p|div|br|li|ul|ol|dl|dt|dd|table|thead|tbody|tr|td|th|"
+    r"h[1-6]|img|blockquote|pre|section|article|header|footer|"
+    r"figure|figcaption|hr)\b",
     re.I,
 )
 
@@ -252,16 +261,21 @@ def clean(value: str | None) -> str:
     if not isinstance(raw, str):
         raw = str(raw)
     text = sanitize_text(_strip_raw_blocks(raw)[:MAX_CLEAN_CHARS])
-    text = html.unescape(text)
-    # 再剥一次 script/style：JSON 源和二次转义源里常见 &lt;style&gt;…&lt;/style&gt;，
-    # 只在 unescape 之前剥，等于漏掉一半（CSS 照样占满 300 字）。
+    # 先处理"没被转义"的真实标签与注释：此时 <b> 是标签，&lt;b&gt; 还是文字。
+    text = _COMMENT.sub(" ", text)
+    text = _strip_tags(text)
+    # 再解一次实体并剥二次转义的 script/style：JSON 源常把整篇 HTML 转义后
+    # 塞进字符串，不在这里处理，CSS/JS 会照样占满 300 字。
     # 这段只有 ≤MAX_CLEAN_CHARS，多一遍线性扫描可以忽略。
+    text = html.unescape(text)
     text = _strip_raw_blocks(text)
+    # 只有整篇像 HTML 文档时才二次剥标签。否则"Use &lt;b&gt; for bold"
+    # 这类在讲标签的正文会被整段吃掉，连标题都可能被清空。
+    if _STRUCTURAL_TAG.search(text):
+        text = _strip_tags(text)
     text = text.translate(_ZERO_WIDTH)
     # 先统一换行符：邮件列表类源大量用 CRLF，行尾的 \r 会让 ^...$ 类的规则匹配不上
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = _COMMENT.sub(" ", text)
-    text = _strip_tags(text)
     text = _IMAGE.sub(r"\1", text)
     text = _LINK.sub(r"\1", text)
     text = _HEADING.sub("", text)
@@ -362,108 +376,6 @@ def parse_time(value) -> int:
     return 0
 
 
-# ---------------------------------------------------------------- 等级
-
-_SEVERITY_WORDS = {
-    "critical": 4,
-    "high": 3,
-    "important": 3,
-    "medium": 2,
-    "moderate": 2,
-    "low": 1,
-    "none": 0,
-}
-_SEVERITY_LABEL = re.compile(
-    r"severity\s*[:：]\s*(critical|high|important|medium|moderate|low|none)", re.I
-)
-# "score" 必须整词出现（否则 "underscore 8 chars" 会被当成 8 分），
-# 分数允许三位数再交给范围校验——以前 \d{1,2} 会把 "score 100" 截成 10 分。
-_SCORE_LABEL = re.compile(
-    r"\b(?:base\s+)?score\s*[:：=]?\s*(\d{1,3}(?:\.\d)?)(?!\d)(?!\.\d)", re.I
-)
-_CVSS_VALUE = re.compile(r"cvss[^\d]{0,12}v?\d(?:\.\d)?\s*[:：]\s*(\d{1,2}(?:\.\d)?)", re.I)
-_CVSS_VERSION = re.compile(r"cvss\s*[:：]?\s*v?(\d(?:\.\d)?)", re.I)
-_CVSS_VECTOR = re.compile(r"CVSS:\d\.\d/[A-Z:/]+", re.I)
-_CVSS_CONTEXT = re.compile(r"cvss|score|severity|评分|风险", re.I)
-# CVSS 版本号只有这几个；"CVSS 9.8" 里的 9.8 是分数，不能当版本剥掉。
-_CVSS_KNOWN_VERSIONS = frozenset({"2.0", "3.0", "3.1", "4.0"})
-# 没有小数点的分数（CVSS 10 / CVSS 9）；要求前面是 cvss 且后面不是数字或点。
-# 句末的句号不算"点"："(?!\d)(?!\.\d)" 允许 "CVSS 10."，但挡住 "CVSS 3.1"。
-_CVSS_INT = re.compile(r"cvss\s*[:：=]?\s*(\d{1,2})(?!\d)(?!\.\d)", re.I)
-# 兜底的裸分数：必须紧跟在 CVSS/评分/风险 后面，最多隔一个连接词。
-# 以前用 _DECIMAL 扫全文，会把 "fixed: 6.6"（内核版本）、"Affected: 4.4"
-# 这类版本号当成 CVSS 分数，给一条只给向量、没给分数的公告编出中危分。
-_CVSS_NEAR = re.compile(
-    r"(?:cvss|评分|风险)\s*(?:评分)?\s*(?:(?:of|is|score)\s*)?[:：=]?\s*"
-    r"(\d{1,2}\.\d)(?!\d)(?!\.\d)",
-    re.I,
-)
-
-
-def _level_of(score: float) -> int:
-    if score >= 9:
-        return 4
-    if score >= 7:
-        return 3
-    if score >= 4:
-        return 2
-    return 1 if score > 0 else 0
-
-
-def _strip_cvss_versions(text: str) -> str:
-    """只剥掉真正的版本号，保留 "CVSS 9.8" 这类裸分数。
-
-    版本号换成一个 " cvss " 占位而不是空串：后面的分数还得靠这个语境词才能
-    被认出来（"CVSS 3.1 9.8" 剥完是 " cvss  9.8"）。
-    """
-
-    def replace(match: re.Match[str]) -> str:
-        return " cvss " if match.group(1) in _CVSS_KNOWN_VERSIONS else match.group(0)
-
-    return _CVSS_VERSION.sub(replace, text)
-
-
-def cvss_of(text: str) -> float:
-    """提取 CVSS 基础分（0~10），取不到返回 0。
-
-    必须限定在 CVSS 语境里找数字，否则 "PHP 8.1.2 Released" 里的版本号 8.1
-    会被当成 8.1 分，把一条发布公告标成高危。
-    """
-    text = text or ""
-    for pattern in (_SCORE_LABEL, _CVSS_VALUE):
-        match = pattern.search(text)
-        if match:
-            value = float(match.group(1))
-            if 0 <= value <= 10:
-                return value
-    if not _CVSS_CONTEXT.search(text):
-        return 0.0
-    # "CVSS 10" / "CVSS 9" 这类整数分数；放在版本剥离之前，
-    # 避免 _CVSS_INT 把 "CVSS 3.1" 里的 3 误认成整数分数。
-    integer = _CVSS_INT.search(text)
-    if integer:
-        value = float(integer.group(1))
-        # 2/3/4 更可能是 "CVSS 3" 这种版本写法，不当成整数分数。
-        if value not in {2.0, 3.0, 4.0} and 0 <= value <= 10:
-            return value
-    stripped = _strip_cvss_versions(_CVSS_VECTOR.sub(" cvss ", text))
-    match = _CVSS_NEAR.search(stripped)
-    if match:
-        value = float(match.group(1))
-        if 0 <= value <= 10:
-            return value
-    return 0.0
-
-
-def severity_of(text: str) -> int:
-    """严重等级 0-4：先认厂商自己写的等级词，没有再看 CVSS 分数。"""
-    text = text or ""
-    label = _SEVERITY_LABEL.search(text)
-    if label:
-        return _SEVERITY_WORDS[label.group(1).lower()]
-    return _level_of(cvss_of(text))
-
-
 # ---------------------------------------------------------------- 构造
 
 def _cves(*texts: str) -> tuple[str, ...]:
@@ -485,6 +397,7 @@ def build_item(
     exploited: bool | None = None,
     ransomware: bool = False,
     severity: int | None = None,
+    cvss: float | None = None,
 ) -> Item | None:
     """统一做截断与兜底；uid 或标题为空则丢弃该条目。"""
     uid = _clean_uid(uid)
@@ -513,7 +426,7 @@ def build_item(
         exploited=source.exploited if exploited is None else exploited,
         ransomware=ransomware,
         severity=severity_of(full_text) if severity is None else severity,
-        cvss=cvss_of(full_text),
+        cvss=cvss_of(full_text) if cvss is None else cvss,
     )
 
 
@@ -824,10 +737,44 @@ _P_CLOSE = re.compile(r"</p\s*>", re.I)
 # nginx 的公告块一定带 "Severity:" 行；用不含捕获的线性正则判断，避免 lower() 复制整段
 _SEVERITY_WORD = re.compile(r"severity", re.I)
 _BR = re.compile(r"<br\s*/?>", re.I)
-_LINK_TAG = re.compile(r"<a\b[^>]{0,300}>(.*?)</a>", re.I | re.S)
+_OPEN_A = re.compile(r"<a(?=[\s/>])", re.I)
+_CLOSE_A = re.compile(r"</a\s*>", re.I)
+_LI_OPEN = re.compile(r"<li(?=[\s/>])", re.I)
+_LI_CLOSE = re.compile(r"</li\s*>", re.I)
 _A_HREF = re.compile(r"""<a\b[^>]{0,300}?href\s*=\s*["']([^"']{1,600})["']""", re.I)
 # 链接文字是这些的时候没有信息量，和后面的【编号】重复
 _NOISE = {"advisory", "advisories", "details", "详情", "公告"}
+
+
+def _unwrap_links(text: str) -> str:
+    """去掉 <a …>…</a> 的外壳，只留链接文字。
+
+    刻意不用 `(.*?)</a>`：块里只要有大量未闭合的 <a>，每个都要一路扫到块尾，
+    整体退化成 O(n²)（实测 20KB 块、6600 个 <a> 要 433ms；16MB 的错误页能把
+    整轮钉死）。这里用 search 顺序定位，并且一旦后面再没有 </a> 就整体收工。
+    """
+    parts: list[str] = []
+    pos = 0            # 还没写进 parts 的起点
+    cursor = 0         # 下一次查找 opener 的位置
+    while True:
+        opening = _OPEN_A.search(text, cursor)
+        if not opening:
+            break
+        open_end = text.find(">", opening.end())
+        if open_end < 0:
+            break
+        closing = _CLOSE_A.search(text, open_end)
+        if not closing:
+            # 这个 opener 之后没有任何 </a>，后面的 opener 同样没有；原样保留
+            break
+        parts.append(text[pos:opening.start()])
+        parts.append(text[open_end + 1:closing.start()])
+        pos = closing.end()
+        cursor = pos
+    if not parts:
+        return text
+    parts.append(text[pos:])
+    return "".join(parts)
 
 
 def _list_items(text: str):
@@ -835,32 +782,28 @@ def _list_items(text: str):
 
     刻意不用 `(.*?)</li>` 正则：遇到"大量未闭合 <li>"的页面时，每个 <li> 都要
     一路扫到文末才失败，整体退化成 O(n²)——几十 KB 的错误页就能让一轮跑上几分钟。
-    这里用 find 定位，并且一旦后面再没有 </li> 就整体收工，是线性的。
+    这里用 search 定位，并且一旦后面再没有 </li> 就整体收工，是线性的。
+    标签名大小写不敏感（HTML 本来就不区分），`</li >` 这种带空格的写法也认。
     """
     pos = 0
     while True:
-        start = text.find("<li", pos)
-        if start < 0:
+        opening = _LI_OPEN.search(text, pos)
+        if not opening:
             return
-        after = start + 3
-        # 排除 <link>、<line> 这类前缀相同的标签（原正则用 \b 达到同样目的）
-        if after < len(text) and text[after] not in " \t\r\n/>":
-            pos = after
-            continue
-        open_end = text.find(">", after)
+        open_end = text.find(">", opening.end())
         if open_end < 0:
-            tail = text[start:]
+            tail = text[opening.start():]
             if "<p" in tail.lower() or CVE_PATTERN.search(tail):
                 raise ParseError("NGINX 页面结构不完整（<li> 标签被截断），可能响应被截断")
             return
-        close = text.find("</li>", open_end)
-        if close < 0:
+        closing = _LI_CLOSE.search(text, open_end)
+        if not closing:
             tail = text[open_end + 1:]
             if "<p" in tail.lower() or CVE_PATTERN.search(tail):
                 raise ParseError("NGINX 页面结构不完整（<li> 未闭合），可能响应被截断")
             return
-        yield text[open_end + 1:close]
-        pos = close + len("</li>")
+        yield text[open_end + 1:closing.start()]
+        pos = closing.end()
 
 
 def parse_nginx(text: str, source: Source) -> list[Item]:
@@ -881,7 +824,7 @@ def parse_nginx(text: str, source: Source) -> list[Item]:
         if not _SEVERITY_WORD.search(full):
             continue
         # 后面的清洗/unwrap 只看前 MAX_CLEAN_CHARS 个字符：摘要本来只留 300 字，
-        # 没必要为几十万字的段落白烧 CPU（也能挡住未闭合 <a> 的二次复杂度）。
+        # 没必要为几十万字的段落白烧 CPU。
         raw = full[:MAX_CLEAN_CHARS]
         parts = _BR.split(raw)
         title = clean(parts[0])
@@ -890,7 +833,7 @@ def parse_nginx(text: str, source: Source) -> list[Item]:
         cves = _cves(raw)
         details = []
         for part in parts[1:]:
-            detail = clean(_LINK_TAG.sub(r"\1", part))
+            detail = clean(_unwrap_links(part))
             if not detail:
                 continue
             if detail.lower() in _NOISE or detail.upper() in cves:
@@ -914,8 +857,10 @@ def parse_nginx(text: str, source: Source) -> list[Item]:
             link=link,
             summary=summary,
             cves=cves,
-            # 等级从原始段落读：Severity 那行已经从摘要里剔掉了
+            # 等级和分数都从原始段落读：Severity/CVSS 那几行已经从摘要里剔掉，
+            # 只从 title+summary 重算会把同一行里的分数丢掉。
             severity=severity_of(raw),
+            cvss=cvss_of(raw),
         )
         if item:
             items.append(item)

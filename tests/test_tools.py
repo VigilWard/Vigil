@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parent.parent
 CHECK_STDLIB = ROOT / "tools" / "check_stdlib.py"
+PREVIEW_CARDS = ROOT / "tools" / "preview_cards.py"
 
 
 class TestCheckStdlib(unittest.TestCase):
@@ -43,6 +44,23 @@ class TestCheckStdlib(unittest.TestCase):
         result = self._run({"vigil/a.py": "def broken(:\n"})
         self.assertEqual(result.returncode, 1)
         self.assertIn("语法错误", result.stdout)
+
+
+class TestPreviewCards(unittest.TestCase):
+    """预览脚本不在 CI 的关键路径上，但它 import 了真实的渲染链路，必须能跑通。"""
+
+    def test_preview_generates_html(self):
+        with TemporaryDirectory() as tmp:
+            out = Path(tmp) / "cards.html"
+            result = subprocess.run(
+                [sys.executable, str(PREVIEW_CARDS), str(out)],
+                cwd=ROOT, capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            html = out.read_text(encoding="utf-8")
+        self.assertIn("Vigil 推送样式预览", html)
+        self.assertIn("Vigil 测试消息", html)     # sample_message 走真实 render_item
+        self.assertIn("另有", html)               # 顺延提示确实渲染出来了
 
 
 if __name__ == "__main__":

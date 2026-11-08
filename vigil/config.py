@@ -9,7 +9,6 @@ import json
 import os
 import re
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from .models import (
     MAX_ITEMS,
@@ -21,7 +20,7 @@ from .models import (
     Source,
     sanitize_text,
 )
-from .net import allow_private_hosts, is_blocked_host, is_metadata_address
+from .net import check_url
 from .parse import PARSERS
 
 ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -87,33 +86,11 @@ def _str_map(value, name: str, allowed: set[str] | None = None) -> dict[str, str
 
 
 def _check_url(url: str, where: str) -> None:
+    """安全/格式校验统一交给 net.check_url，配置和抓取不会各写一套规则。"""
     try:
-        parts = urlsplit(url)
-        # 访问 .port 就会校验端口合法性，非法端口在这里就拦下来
-        _ = parts.port
+        check_url(url)
     except ValueError as exc:
-        raise ConfigError(f"{where}的 url 无法解析：{exc}") from exc
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise ConfigError(f"{where}的 url 必须是完整的 http/https 地址")
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in url):
-        # 换行/控制字符会让 http.client 在发请求时才抛 ValueError，
-        # 也会把日志和卡片排版弄乱；在配置阶段就拒绝。
-        raise ConfigError(f"{where}的 url 不能包含换行或控制字符")
-    if parts.username is not None or parts.password is not None:
-        raise ConfigError(f"{where}的 url 不应包含用户名或密码，请改用 Secrets 和请求头")
-    # 元数据地址必须先判：它连逃生门也不放行。放在私网判断之后会出现
-    # "请设置 VIGIL_ALLOW_PRIVATE_HOSTS=1"——用户照做后仍然被拒。
-    if is_metadata_address(parts.hostname):
-        raise ConfigError(
-            f"{where}的 url 指向云元数据或链路本地地址，已拒绝"
-            "（这类地址不受 VIGIL_ALLOW_PRIVATE_HOSTS 影响）"
-        )
-    # 启动时就拦住本机/私网地址，而不是等到抓取时才失败（否则每轮都会记一次源失败）。
-    if not allow_private_hosts() and is_blocked_host(parts.hostname):
-        raise ConfigError(
-            f"{where}的 url 指向本机或私网地址，已拒绝；"
-            "如果确实要抓内网源，请设置 VIGIL_ALLOW_PRIVATE_HOSTS=1"
-        )
+        raise ConfigError(f"{where}的 {exc}") from exc
 
 
 def _check_headers(headers: dict[str, str], where: str) -> dict[str, str]:

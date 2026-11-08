@@ -13,17 +13,18 @@ import urllib.request
 from . import net
 from .models import (
     MAX_RESPONSE,
+    RETRY_AFTER_CAP,
     RETRY_BACKOFF,
     RETRY_MAX_WAIT,
     RETRY_STATUS,
     USER_AGENT,
     BudgetExceeded,
     FetchError,
+    Message,
     PushError,
     PushTarget,
     log,
 )
-from .render import Message
 
 # 飞书在限流时返回 HTTP 200 + 业务码：9499（通用）和 11232（自定义机器人最常遇到，
 # 单机器人 100 次/分钟、5 次/秒）。两者都属于可重试，不能当成永久错误。
@@ -39,6 +40,14 @@ class _BusinessError(PushError):
 
 class _RateLimited(PushError):
     """限流，值得退避重试。"""
+
+
+class _Ambiguous(PushError):
+    """请求已经发出，但响应没读完整：飞书可能已经把卡片投递出去了。
+
+    自定义机器人没有幂等键，重试就是真的再发一张卡片。所以这一轮不再重试，
+    消息留在待送达队列里，交给下一轮的补发流程——宁可晚一轮，也不连刷三张。
+    """
 
 
 def sign(secret: str, timestamp: int) -> str:
@@ -116,7 +125,14 @@ def _post_once(body: dict, target: PushTarget, deadline: float | None) -> None:
         method="POST",
     )
     with net.open_url(request, timeout=net.request_timeout(deadline)) as response:
-        raw = net.read_limited(response, MAX_RESPONSE, deadline)
+        try:
+            raw = net.read_limited(response, MAX_RESPONSE, deadline)
+        except (BudgetExceeded, FetchError):
+            # 超预算 / 响应体超限：确定性失败，重试没有意义
+            raise
+        except (TimeoutError, OSError, http.client.HTTPException, EOFError) as exc:
+            # 连接已经建立、请求已经发出，只是没读完响应：可能已送达
+            raise _Ambiguous(f"请求已发出但没读到完整响应：{exc}") from exc
     _check_response(raw)
 
 
@@ -132,22 +148,31 @@ def _send(body: dict, target: PushTarget, deadline: float | None) -> None:
             return
         except _BusinessError:
             raise
+        except _Ambiguous as exc:
+            # 可能已经送达：重试只会多刷卡片，留给下一轮
+            raise PushError(str(exc)) from exc
         except _RateLimited as exc:
             last_error = str(exc)
         except urllib.error.HTTPError as exc:
             last_error = f"HTTP {exc.code}"
             if exc.code not in RETRY_STATUS:
-                # 不在这里拼 target.tid：调用方（_deliver / _send_alerts）已经带了目标信息，
+                # 不在这里拼 target.tid：调用方（_deliver / send_alerts）已经带了目标信息，
                 # 两边都拼会变成"推送到 xxx 失败：推送到 xxx 失败：..."
                 raise PushError(last_error) from exc
             wait = net.retry_after(exc.headers)
+            if wait is not None and wait > RETRY_AFTER_CAP:
+                # 与抓取侧一致：等太久就本轮放弃，别占着预算干等
+                raise PushError(
+                    f"飞书要求 {wait:.0f}s 后重试，超过单次等待上限 {RETRY_AFTER_CAP:.0f}s"
+                ) from exc
         except BudgetExceeded as exc:
             raise PushError(f"推送超过整轮时间预算：{exc}") from exc
-        except (PushError, FetchError, urllib.error.URLError, TimeoutError,
-                OSError, http.client.HTTPException, EOFError) as exc:
-            # FetchError 来自 net（响应体超限、字符集无法识别）。
-            # 必须在这里接住并转成 PushError：否则它会一路冒到 main，
-            # 变成"配置错误"退出码 2，整轮其它群也一起放弃。
+        except FetchError as exc:
+            # 响应体超过上限这类确定性失败：重试三次结果完全一样，只是白下载
+            raise PushError(f"推送失败：{exc}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError,
+                http.client.HTTPException, EOFError) as exc:
+            # 连接阶段失败（请求多半没发出去），换一次连接有意义
             last_error = str(getattr(exc, "reason", exc)) or exc.__class__.__name__
 
         if attempt + 1 >= PUSH_ATTEMPTS:
