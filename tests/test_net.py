@@ -483,6 +483,13 @@ class TestUrlGuard(unittest.TestCase):
         """inet_aton 对含 NUL 的主机名抛 ValueError，不能让异常逃出 fetch。"""
         self.assertTrue(net.is_blocked_host("local\x00host"))
 
+    def test_ideographic_full_stop_host_is_blocked(self):
+        """IDNA 会把 "。" 映射成 "."；结尾点必须在归一化之后再去一次。"""
+        self.assertTrue(net.is_blocked_host("localhost\u3002"))
+        self.assertTrue(net.is_blocked_host("127.0.0.1\u3002"))
+        self.assertTrue(net.is_metadata_address("169.254.169.254\u3002"))
+        self.assertEqual(net._ascii_host("localhost\u3002"), "localhost")
+
 
 class TestDecodeAliases(unittest.TestCase):
     """编码名先归一化再比对；高位字节要在整篇里找。"""
@@ -514,7 +521,8 @@ class TestFetchBudget(unittest.TestCase):
         with mock.patch("vigil.net.open_url", side_effect=error) as opener, \
                 mock.patch("time.sleep"), self.assertRaises(FetchError) as ctx:
             net.fetch("https://a.test/x")
-        self.assertIn(f"已尝试 {opener.call_count} 次", str(ctx.exception))
+        self.assertEqual(opener.call_count, 3)
+        self.assertIn("已尝试 3 次", str(ctx.exception))
 
 
 if __name__ == "__main__":

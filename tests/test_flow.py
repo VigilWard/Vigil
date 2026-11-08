@@ -159,6 +159,56 @@ class TestBasics(FlowCase):
         self.assertEqual(self.run_main(), 0)      # 真实运行：只建基线
         self.assertEqual(self.posts, [])
 
+    def test_dry_run_baseline_preview_does_not_claim_deferral(self):
+        """首轮只会建基线：被每源 limit 截掉的条目不是"顺延"。"""
+        self.feed = build_rss([(f"g{i}", f"公告 {i}", "d") for i in range(20)])
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.run_main("--dry-run"), 0)
+        text = output.getvalue()
+        self.assertIn("本轮会发 0 条消息", text)
+        self.assertIn("本轮共 20 条", text)
+        self.assertIn("展示其中最要紧的 10 条", text)
+        self.assertNotIn("顺延", text)
+
+    def test_dry_run_splits_new_sources_before_merging(self):
+        """新源条目首轮不进队列，不能先在 merge 里把老源条目"吞"掉。"""
+        def rss(entries):
+            stamp = format_datetime(datetime.now(timezone.utc))
+            body = "".join(
+                f"<item><title>{title}</title><link>https://a.test/{guid}</link>"
+                f"<guid>{guid}</guid><pubDate>{stamp}</pubDate>"
+                f"<description>{desc}</description></item>"
+                for guid, title, desc in entries)
+            return f'<?xml version="1.0"?><rss version="2.0"><channel>{body}</channel></rss>'
+
+        feeds = {"old": [("o0", "老源历史", "d")], "new": []}
+
+        def fetch(url, **kwargs):
+            return Response(rss(feeds["old" if "old" in url else "new"]), '"e"', "")
+
+        self.write_config([{"name": "老源", "url": "https://a.test/old"}])
+        with mock.patch("vigil.collect.fetch", fetch):
+            self.run_main()                       # 老源建基线
+
+        feeds["old"].append(("o1", "老源低危 CVE-2026-1111", "Severity: low"))
+        feeds["new"].append(("n1", "新源高危 CVE-2026-1111", "Severity: critical"))
+        self.write_config([{"name": "老源", "url": "https://a.test/old"},
+                           {"name": "新源", "url": "https://a.test/new"}])
+
+        with mock.patch("vigil.collect.fetch", fetch), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.run_main("--dry-run"), 0)
+        text = output.getvalue()
+        self.assertIn("本轮会发 1 条消息", text)
+        send_section = text.split("以下来自")[0]
+        self.assertIn("【来源】老源", send_section)
+        self.assertNotIn("【另见】", send_section)   # 新源条目没有被合进发送段
+
+        with mock.patch("vigil.collect.fetch", fetch):
+            self.assertEqual(self.run_main(), 0)
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("老源低危", self.posts[0])
+
     def test_dry_run_reports_skipped_sources(self):
         """全被预算跳过时 items 为空，预览也必须说明"本轮未检查"。"""
         with mock.patch("vigil.app.FETCH_BUDGET", 0), \

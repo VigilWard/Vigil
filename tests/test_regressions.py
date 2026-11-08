@@ -617,7 +617,8 @@ class TestFeishuRetryAfter(unittest.TestCase):
         with mock.patch("vigil.net.open_url", side_effect=http_error(503)) as opener, \
                 mock.patch("time.sleep"), self.assertRaises(PushError) as ctx:
             feishu.send("hi", PushTarget("https://hook.test/x", ""))
-        self.assertIn(f"已尝试 {opener.call_count} 次", str(ctx.exception))
+        self.assertEqual(opener.call_count, 3)
+        self.assertIn("已尝试 3 次", str(ctx.exception))
 
 
 class TestLinkSanitizingRegression(unittest.TestCase):
@@ -835,16 +836,6 @@ class TestNginxLinearScan(unittest.TestCase):
                 '<link rel="alternate" href="https://e.test/x">')
         items = parse_nginx(html, NGINX_SOURCE)
         self.assertEqual([item.uid for item in items], ["CVE-2026-1111"])
-
-
-class TestFeishuTransportError(unittest.TestCase):
-    def test_fetch_error_becomes_push_error(self):
-        """net 层的 FetchError 必须转成 PushError，否则会以"配置错误"退出码 2
-        结束整轮，连累其它群一起放弃。"""
-        with mock.patch("vigil.net.open_url", return_value=FakeResponse(b"")), \
-                mock.patch("vigil.net.read_limited", side_effect=FetchError("响应超过上限")), \
-                mock.patch("time.sleep"), self.assertRaises(PushError):
-            feishu.send("hi", PushTarget("https://hook.test/x", ""))
 
 
 def make_cve_item(source, uid, title, *, severity=0, cvss=0.0, exploited=False,
@@ -1250,6 +1241,16 @@ class TestAlertChunking(unittest.TestCase):
         chunks = list(_alert_chunks([alert], 100))
         self.assertEqual(len(chunks), 1)
         self.assertLessEqual(len(chunks[0][0][1].encode("utf-8")), 100)
+
+    def test_chunk_boundary_counts_separator_once(self):
+        """新块的第一条前面没有换行：90 + 1 + 9 = 100 应该同块，不能多切一条。"""
+        from vigil.alerts import Alert, _alert_chunks
+
+        alerts = [Alert("fail", "a", "x" * 10), Alert("fail", "b", "x" * 90),
+                  Alert("fail", "c", "x" * 9)]
+        chunks = list(_alert_chunks(alerts, 100))
+        self.assertEqual([len(chunk) for chunk in chunks], [1, 2])
+        self.assertEqual(len("\n".join(t for _, t in chunks[1]).encode("utf-8")), 100)
 
 
 class TestOneMessagePerItem(unittest.TestCase):

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import http.client
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -124,7 +126,8 @@ def _post_once(body: dict, target: PushTarget, deadline: float | None) -> None:
         },
         method="POST",
     )
-    with net.open_url(request, timeout=net.request_timeout(deadline)) as response:
+    response = net.open_url(request, timeout=net.request_timeout(deadline))
+    try:
         try:
             raw = net.read_limited(response, MAX_RESPONSE, deadline)
         except (BudgetExceeded, FetchError):
@@ -133,6 +136,12 @@ def _post_once(body: dict, target: PushTarget, deadline: float | None) -> None:
         except (TimeoutError, OSError, http.client.HTTPException, EOFError) as exc:
             # 连接已经建立、请求已经发出，只是没读完响应：可能已送达
             raise _Ambiguous(f"请求已发出但没读到完整响应：{exc}") from exc
+    finally:
+        # 不用 with：__exit__ 抛错会覆盖已经读到的响应（或覆盖 _Ambiguous），
+        # 让"确定成功/可能已送达"变成"可重试的连接错误"。关闭失败本身不影响
+        # 送达判定，吞掉即可。
+        with contextlib.suppress(OSError, http.client.HTTPException):
+            response.close()
     _check_response(raw)
 
 
@@ -161,9 +170,11 @@ def _send(body: dict, target: PushTarget, deadline: float | None) -> None:
                 raise PushError(last_error) from exc
             wait = net.retry_after(exc.headers)
             if wait is not None and wait > RETRY_AFTER_CAP:
-                # 与抓取侧一致：等太久就本轮放弃，别占着预算干等
+                # 与抓取侧一致：等太久就本轮放弃，别占着预算干等。
+                # Retry-After: inf 也能解析成浮点数，格式化前要先判有限性。
+                shown = f"{wait:.0f}s" if math.isfinite(wait) else "一个极大的时长"
                 raise PushError(
-                    f"飞书要求 {wait:.0f}s 后重试，超过单次等待上限 {RETRY_AFTER_CAP:.0f}s"
+                    f"飞书要求 {shown} 后重试，超过单次等待上限 {RETRY_AFTER_CAP:.0f}s"
                 ) from exc
         except BudgetExceeded as exc:
             raise PushError(f"推送超过整轮时间预算：{exc}") from exc
@@ -172,7 +183,10 @@ def _send(body: dict, target: PushTarget, deadline: float | None) -> None:
             raise PushError(f"推送失败：{exc}") from exc
         except (urllib.error.URLError, TimeoutError, OSError,
                 http.client.HTTPException, EOFError) as exc:
-            # 连接阶段失败（请求多半没发出去），换一次连接有意义
+            # 连接阶段失败（请求多半没发出去），换一次连接有意义。
+            # 注意 urllib 在 getresponse() 之前就已经写出请求体，"等响应头超时"
+            # 也会落到这里并重试——无法与"根本没连上"区分。自定义机器人没有
+            # 幂等键，这是 at-least-once 的固有代价：宁可偶尔重复一张，也不丢。
             last_error = str(getattr(exc, "reason", exc)) or exc.__class__.__name__
 
         if attempt + 1 >= PUSH_ATTEMPTS:

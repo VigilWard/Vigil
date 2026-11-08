@@ -141,13 +141,56 @@ class TestResponseHandling(unittest.TestCase):
         self.assertIn("sign match fail", str(ctx.exception))
 
     def test_oversized_response_is_not_retried(self):
-        """响应体超限是确定性失败：重试三次只是白下载三遍。"""
+        """net 层的 FetchError 必须转成 PushError（否则会以"配置错误"退出码 2
+        结束整轮、连累其它群），且确定性失败不重试：重试三次只是白下载三遍。"""
         with mock.patch("vigil.net.open_url", return_value=FakeResponse(b"")), \
                 mock.patch("vigil.net.read_limited",
                            side_effect=FetchError("响应超过上限")) as reader, \
                 self.assertRaises(PushError):
             feishu.send("hi", TARGET)
         self.assertEqual(reader.call_count, 1)
+
+    def test_close_error_does_not_turn_success_into_retry(self):
+        """响应已经读完、close 才报错：不能把它当成连接失败去重发。"""
+        class CloseBoom(FakeResponse):
+            def close(self):
+                raise OSError("close failed")
+
+        with mock.patch("vigil.net.open_url",
+                        return_value=CloseBoom(b'{"code":0}')) as opener, \
+                mock.patch("time.sleep") as sleeper:
+            feishu.send("hi", TARGET)
+        self.assertEqual(opener.call_count, 1)
+        sleeper.assert_not_called()
+
+    def test_close_error_does_not_mask_ambiguous_result(self):
+        """读响应已经超时（可能已送达）时，close 报错不能把它变回"可重试"。"""
+        class Broken(FakeResponse):
+            def read(self, size=None):
+                raise TimeoutError("read timed out")
+
+            def close(self):
+                raise OSError("close failed")
+
+        with mock.patch("vigil.net.open_url", return_value=Broken(b"")) as opener, \
+                mock.patch("time.sleep") as sleeper, \
+                self.assertRaises(PushError) as ctx:
+            feishu.send("hi", TARGET)
+        self.assertEqual(opener.call_count, 1)
+        sleeper.assert_not_called()
+        self.assertIn("已发出", str(ctx.exception))
+
+    def test_infinite_retry_after_is_reported_without_inf(self):
+        """Retry-After: inf 能被 float() 解析，但格式化前必须判有限性。"""
+        error = http_error(429, {"Retry-After": "inf"})
+        with mock.patch("vigil.net.open_url", side_effect=error) as opener, \
+                mock.patch("time.sleep") as sleeper, \
+                self.assertRaises(PushError) as ctx:
+            feishu.send("hi", TARGET)
+        self.assertEqual(opener.call_count, 1)
+        sleeper.assert_not_called()
+        self.assertIn("超过单次等待上限", str(ctx.exception))
+        self.assertNotIn("inf", str(ctx.exception).lower())
 
     def test_retry_after_is_capped_without_deadline(self):
         """没有 deadline 时也要受单次等待上限约束，不能真的睡两分钟。"""

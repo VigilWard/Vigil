@@ -83,7 +83,9 @@ def _ascii_host(host: str) -> str:
     if not host or host.isascii():
         return host.lower()
     try:
-        return host.encode("idna").decode("ascii").lower()
+        # IDNA 会把 U+3002（表意句号）等映射成 "."，所以编码之后还要再去一次
+        # 结尾点；否则 "localhost。" 会变成 "localhost."，字面检查认不出来。
+        return host.encode("idna").decode("ascii").lower().rstrip(".")
     except UnicodeError:
         return host.lower()
 

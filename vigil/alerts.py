@@ -137,6 +137,7 @@ def _alert_chunks(alerts: list[Alert], budget: int):
             yield chunk
             chunk = []
             size = 0
+            separator = 0        # 新块的第一条前面没有换行，不能再算 1 字节
         if length > budget:
             # 正常不会走到这里（源名有长度上限），但保留兜底。
             text = shorten_bytes(text, budget)

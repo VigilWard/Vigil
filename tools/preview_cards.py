@@ -5,7 +5,7 @@
     python tools/preview_cards.py            # 写到 preview/cards.html
     python tools/preview_cards.py out.html
 
-内容全部走 vigil 的真实代码路径（render.compose / feishu.card_of / app.sample_message），
+内容全部走 vigil 的真实代码路径（digest.compose / feishu.card_of / app.sample_message），
 所以预览里看到什么，飞书里就是什么。颜色值取自飞书客户端的近似值。
 """
 from __future__ import annotations
@@ -271,7 +271,7 @@ TEMPLATE = """<!doctype html>
 <div class="wrap">
   <h1>Vigil 推送样式预览</h1>
   <p class="lede">
-    下面每一张卡片都是 <code>render.compose()</code> + <code>feishu.card_of()</code> 的真实输出，
+    下面每一张卡片都是 <code>digest.compose()</code> + <code>feishu.card_of()</code> 的真实输出，
     只是把 lark_md 渲染成了等价 HTML。颜色为飞书客户端模板色的近似值。
   </p>
 

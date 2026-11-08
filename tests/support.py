@@ -9,13 +9,15 @@ from typing import Any
 class FakeResponse:
     """够用的 urlopen 响应替身：read/headers/上下文管理。"""
 
-    def __init__(self, body: bytes, headers: dict[str, str] | None = None, status: int = 200):
+    def __init__(self, body: bytes, headers: dict[str, str] | None = None):
         self._body = io.BytesIO(body)
         self.headers = headers or {}
-        self.status = status
 
     def read(self, size=None):
         return self._body.read(size)
+
+    def close(self):
+        self._body.close()
 
     def __enter__(self):
         return self

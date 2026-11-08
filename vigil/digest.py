@@ -240,11 +240,15 @@ def compose(
     markup: bool = True,
     budget: int = MAX_CARD_BODY_BYTES,
     max_messages: int = MAX_MESSAGES,
+    show_overflow: bool = True,
 ) -> list[Message]:
     """把条目渲染成一条条消息，一条公告一条。
 
     返回的每一条都带着自己的 keys（含被跨源合并掉的条目），调用方逐条发送、
     逐条确认；没发出去的自然留在队列里，下一轮补发。
+
+    show_overflow=False 用于"这些条目本来就不会发"的预览（例如首次接入的源
+    只建基线）：那里被 limit 截掉的条目不是顺延，不能写"另有 N 条顺延"。
     """
     failures = failures or []
     skipped = skipped or []
@@ -281,7 +285,7 @@ def compose(
             # 源异常提示搭第一条的车：不额外占一条消息，也不会因为后面某条
             # 推送失败而丢掉（第一条失败时整轮都不会确认，下一轮会重发）
             tops.extend(notes)
-        if index == total and overflow:
+        if index == total and overflow and show_overflow:
             tops.append(f"⚠ 另有 {overflow} 条顺延到下一轮")
         if tops:
             body = "\n".join(tops) + "\n\n" + body

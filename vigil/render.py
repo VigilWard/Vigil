@@ -116,8 +116,9 @@ def _neutralize_entities(text: str) -> str:
             out.append(char)
             index += 1
             continue
-        if text.startswith("&amp;", index):
+        if text.startswith("&amp;", index) or text.startswith("&AMP;", index):
             # 唯一保留的实体：解码回来就是 &，构造不出标记。
+            # &AMP; 是 HTML5 里合法的大写写法，不能当成"未知实体"编码掉。
             out.append("&amp;")
             index += 5
             continue

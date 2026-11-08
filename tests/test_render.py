@@ -468,6 +468,11 @@ class TestLinkSanitizing(unittest.TestCase):
     def test_query_ampersand_survives(self):
         url = "https://e.test/a?x=1&amp;y=2"
         self.assertEqual(sanitize_link(url), url)
+        # &AMP; 是 HTML5 里合法的大写实体，解码回来同样是 &，不能编码成 %26
+        self.assertEqual(sanitize_link("https://e.test/a?x=1&AMP;y=2"),
+                         "https://e.test/a?x=1&amp;y=2")
+        for text in (url, "https://e.test/a?x=1&AMP;y=2"):
+            self.assertIn("x=1&y=2", html.unescape(sanitize_link(text)))
 
     def test_numeric_ampersand_is_normalized(self):
         """&#38; / &#x26; 就是 &，不能被当成危险实体删掉（否则查询参数被改坏）。"""

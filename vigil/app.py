@@ -168,7 +168,16 @@ def cmd_dry_run(config: Config, state_path: Path) -> int:
     pending = state.pending_items()
     fresh_keys = {item.key for item in report.items}
     pending = [item for item in pending if item.key not in fresh_keys]
-    items = merge(report.items + pending, config)
+
+    # 还没有基线的源，第一次真实运行只会 state.remember、不会推送。
+    # 必须在 merge 之前就按源拆开：真跑时新源条目根本不进队列，不会参与
+    # 跨源合并。先 merge 再拆会让新生源的高危条目把老源条目"吞"进 merged，
+    # 预览显示 0 条会发，而真跑其实会发那一条老源条目。
+    new_keys = {source.key for source in config.sources if not state.health(source.key).initialized}
+    fresh_new = [item for item in report.items if item.source_key in new_keys]
+    fresh_old = [item for item in report.items if item.source_key not in new_keys]
+    items = merge(fresh_old + pending, config)
+    baselining = merge(fresh_new, config)
 
     for failure in report.failures:
         log(f"⚠ {failure.name}：{failure.detail}")
@@ -180,25 +189,22 @@ def cmd_dry_run(config: Config, state_path: Path) -> int:
     if pending:
         log(f"注：队列里还有 {len(pending)} 条上一轮没送达的，会一起发。")
 
-    # 还没有基线的源，第一次真实运行只会 state.remember、不会推送。
-    # 预览里必须把它们单独列出来：算进"本轮会发"会让人以为真跑会发这么多。
-    new_keys = {source.key for source in config.sources if not state.health(source.key).initialized}
-    baselining = [item for item in items if item.source_key in new_keys]
-    sendable = [item for item in items if item.source_key not in new_keys]
-
     # 用和线上一致的卡片预算与消息上限渲染，否则这里显示的条数和实际发出去的对不上
-    messages = compose(config, sendable, failures=report.failures,
+    messages = compose(config, items, failures=report.failures,
                        skipped=report.skipped, markup=False, budget=MAX_CARD_BODY_BYTES,
                        max_messages=MAX_MESSAGES)
     _print_messages(messages)
 
     if baselining:
-        # 只用于确认新源能解析出什么；数量可能被 compose 的每源 limit 截断，
-        # 所以这里不说"共 N 条"，只说这一轮有多少条只建基线。
+        # 这些条目首轮只会被 remember，不存在"顺延"：截断提示必须关掉。
+        # 数量可能被每源 limit 截断，所以头部同时说明总数与展示条数。
         preview = compose(config, baselining, markup=False,
-                          budget=MAX_CARD_BODY_BYTES, max_messages=MAX_MESSAGES)
+                          budget=MAX_CARD_BODY_BYTES, max_messages=MAX_MESSAGES,
+                          show_overflow=False)
+        shown = (f"（下面展示其中最要紧的 {len(preview)} 条）"
+                 if len(preview) < len(baselining) else "")
         _print_messages(preview, header=(
-            f"--- 以下来自尚未建基线的源（本轮共 {len(baselining)} 条）："
+            f"--- 以下来自尚未建基线的源：本轮共 {len(baselining)} 条{shown}，"
             "首次真实运行只建基线、不会推送 ---"
         ))
 
@@ -207,8 +213,10 @@ def cmd_dry_run(config: Config, state_path: Path) -> int:
         return 0
 
     extra = f"；另有 {len(baselining)} 条来自首次接入的源，只建基线" if baselining else ""
-    log(f"dry-run：候选 {len(items)} 条，本轮会发 {len(messages)} 条消息{extra}"
-        f"（超出每源 limit / 单轮上限的部分顺延）。未发送、未改动基线。")
+    # 全是"只建基线"的条目时没有可顺延的东西，别把通用说明挂在一句空话后面
+    tail = "（超出每源 limit / 单轮上限的部分顺延）" if messages else ""
+    log(f"dry-run：候选 {len(items)} 条，本轮会发 {len(messages)} 条消息{tail}{extra}"
+        "。未发送、未改动基线。")
     return 0
 
 
